@@ -95,96 +95,140 @@ __global__ void flash_attention_forward_kernel(
     __shared__ float v_tile[T_c][HEAD_DIM]; // Stores a tile of V vectors.
     __shared__ float s_tile[T_r][T_c];      // Stores QK^T scores for the current q_tile and k_tile.
 
-    // --- Iterate over T_r Query Rows Processed by this Block ---
-    // Each iteration of this loop processes one query vector Q_i from the block of T_r queries.
-    // The online softmax statistics (m_i, l_i, o_i) are maintained per query Q_i.
-    for (int q_tile_row_idx = 0; q_tile_row_idx < T_r; ++q_tile_row_idx) {
-        const int q_abs_idx = q_block_start_row + q_tile_row_idx; // Absolute index in Q sequence.
-        if (q_abs_idx >= seq_len_q) continue; // Boundary check: stop if past actual Q sequence length.
-
-        // --- Initialize Online Softmax Statistics and Output Accumulator ---
-        // m_i: current maximum score for Q_i (running max).
-        // l_i: current sum of exp(score - m_i) for Q_i (running sum for normalizer).
-        // o_i: accumulator for the output vector for Q_i (running sum of P_ij * V_j).
-        float m_i = -std::numeric_limits<float>::infinity();
-        float l_i = 0.0f;
-        float o_i[HEAD_DIM]; // Temporary register array for the current Q_i's output vector.
-        for (int h_col = 0; h_col < actual_head_dim; ++h_col) {
-            o_i[h_col] = 0.0f;
-        }
-
-        // --- Load Current Query Vector (Q_i) into Shared Memory ---
-        // Threads in the block cooperate to load Q_i into q_tile[q_tile_row_idx].
-        // This simple load assumes q_tile[q_tile_row_idx] is for the current q_abs_idx.
-        // A more complex strategy might load all T_r Q-vectors into q_tile at once
-        // if threads within the block were to process multiple Q_i simultaneously.
-        // Current model: one Q_i processed by the block through all K/V tiles.
+    // --- Initialize Output Accumulators and Online Softmax Statistics ---
+    // Each thread handles one query row, storing state in registers
+    const int local_q_idx = threadIdx.y; // Thread's query row within the block
+    const int q_abs_idx = q_block_start_row + local_q_idx; // Absolute query index
+    
+    // Per-thread online softmax statistics and output accumulator
+    float m_i = -std::numeric_limits<float>::infinity();
+    float l_i = 0.0f;
+    float o_i[HEAD_DIM] = {0}; // Initialize to zero
+    
+    // Early exit for threads beyond valid query range
+    bool valid_q = (q_abs_idx < seq_len_q);
+    
+    // --- Load Q-block into Shared Memory (All threads cooperate) ---
+    // Load T_r query vectors into shared memory in parallel
+    for (int q_row = threadIdx.y; q_row < T_r; q_row += blockDim.y) {
+        int q_abs_row = q_block_start_row + q_row;
         for (int h_col = threadIdx.x; h_col < actual_head_dim; h_col += blockDim.x) {
-            q_tile[q_tile_row_idx][h_col] = Q_acc[batch_idx][head_idx][q_abs_idx][h_col];
+            if (q_abs_row < seq_len_q) {
+                q_tile[q_row][h_col] = Q_acc[batch_idx][head_idx][q_abs_row][h_col];
+            } else {
+                q_tile[q_row][h_col] = 0.0f;
+            }
         }
-        // A __syncthreads() might be implied or needed here if all threads in the block
-        // immediately depend on this specific Q_i being fully loaded for S_ij computation.
-        // Given the s_tile computation structure, it's implicitly handled by the __syncthreads()
-        // after S_ij computation.
+    }
+    __syncthreads(); // Ensure all Q vectors are loaded
 
-        // --- Outer Loop: Iterate over Key/Value Blocks (Tiles of K and V) ---
-        // Process K and V in tiles of size T_c to manage memory movement.
-        for (int kv_block_col_start = 0; kv_block_col_start < seq_len_kv; kv_block_col_start += T_c) {
-            
-            // --- Load K_j_tile and V_j_tile into Shared Memory ---
-            // Threads cooperate to load T_c vectors of K and V into k_tile and v_tile.
-            // threadIdx.y iterates over rows of the K/V tile (up to T_c).
-            // threadIdx.x iterates over elements of the head dimension for each K/V vector.
-            for (int tc_row = threadIdx.y; tc_row < T_c; tc_row += blockDim.y) { 
-                for (int h_col = threadIdx.x; h_col < actual_head_dim; h_col += blockDim.x) { 
-                    int k_abs_row_idx = kv_block_col_start + tc_row; // Absolute index in K/V sequence.
-                    if (k_abs_row_idx < seq_len_kv) { // Boundary check for K/V sequence length.
-                        k_tile[tc_row][h_col] = K_acc[batch_idx][head_idx][k_abs_row_idx][h_col];
-                        v_tile[tc_row][h_col] = V_acc[batch_idx][head_idx][k_abs_row_idx][h_col];
-                    } else { // Pad with zeros if past actual K/V sequence length.
-                        k_tile[tc_row][h_col] = 0.0f;
-                        v_tile[tc_row][h_col] = 0.0f;
-                    }
+    // --- Outer Loop: Iterate over Key/Value Blocks (Tiles of K and V) ---
+    // Process K and V in tiles of size T_c to manage memory movement.
+    for (int kv_block_col_start = 0; kv_block_col_start < seq_len_kv; kv_block_col_start += T_c) {
+        
+        // --- Load K_j_tile and V_j_tile into Shared Memory ---
+        // All threads cooperate to load T_c vectors of K and V into k_tile and v_tile.
+        for (int tc_row = threadIdx.y; tc_row < T_c; tc_row += blockDim.y) { 
+            for (int h_col = threadIdx.x; h_col < actual_head_dim; h_col += blockDim.x) { 
+                int k_abs_row_idx = kv_block_col_start + tc_row; // Absolute index in K/V sequence.
+                if (k_abs_row_idx < seq_len_kv) { // Boundary check for K/V sequence length.
+                    k_tile[tc_row][h_col] = K_acc[batch_idx][head_idx][k_abs_row_idx][h_col];
+                    v_tile[tc_row][h_col] = V_acc[batch_idx][head_idx][k_abs_row_idx][h_col];
+                } else { // Pad with zeros if past actual K/V sequence length.
+                    k_tile[tc_row][h_col] = 0.0f;
+                    v_tile[tc_row][h_col] = 0.0f;
                 }
             }
-            __syncthreads(); // Ensure K_tile and V_tile are fully loaded before use.
+        }
+        __syncthreads(); // Ensure K_tile and V_tile are fully loaded before use.
 
-            // --- Compute Scores S_ij = (Q_i @ K_j_tile.T) * sm_scale ---
-            // Q_i is q_tile[q_tile_row_idx]. K_j_tile is k_tile.
-            // Scores are stored in s_tile[q_tile_row_idx][...].
-            // Parallelism: threadIdx.y=0 computes scores for its assigned k_tile_col_idx.
-            // This is a simplification; typically, more threads would participate if T_c > blockDim.x.
-            if (threadIdx.y == 0) { 
-                for (int k_tile_col_idx = threadIdx.x; k_tile_col_idx < T_c; k_tile_col_idx += blockDim.x) {
-                    float sum_qk = 0.0f; // Dot product accumulator.
-                    for (int d = 0; d < actual_head_dim; ++d) {
-                        sum_qk += q_tile[q_tile_row_idx][d] * k_tile[k_tile_col_idx][d];
-                    }
-                    float current_s_val = sum_qk * sm_scale; // Apply scaling factor.
-
-                    // Apply causal masking if enabled.
-                    if (is_causal) {
-                        int k_abs_idx = kv_block_col_start + k_tile_col_idx; // Absolute key index.
-                        if (k_abs_idx > q_abs_idx) { // If key is "after" query.
-                            current_s_val = -std::numeric_limits<float>::infinity();
-                        }
-                    }
-                    s_tile[q_tile_row_idx][k_tile_col_idx] = current_s_val;
+        // --- Compute Scores S_ij = (Q_i @ K_j_tile.T) * sm_scale ---
+        // Each thread computes scores for its assigned query row
+        if (valid_q) {
+            for (int k_tile_col_idx = threadIdx.x; k_tile_col_idx < T_c; k_tile_col_idx += blockDim.x) {
+                float sum_qk = 0.0f; // Dot product accumulator.
+                for (int d = 0; d < actual_head_dim; ++d) {
+                    sum_qk += q_tile[local_q_idx][d] * k_tile[k_tile_col_idx][d];
                 }
-            }
-            __syncthreads(); // Ensure all S_ij scores for this Q_i and K_tile are computed.
+                float current_s_val = sum_qk * sm_scale; // Apply scaling factor.
 
-            // --- Online Softmax: Update Statistics and Output Accumulator ---
-            // 1. Find maximum score in the current S_ij tile row (for Q_i).
+                // Apply causal masking if enabled.
+                if (is_causal) {
+                    int k_abs_idx = kv_block_col_start + k_tile_col_idx; // Absolute key index.
+                    if (k_abs_idx > q_abs_idx) { // If key is "after" query.
+                        current_s_val = -std::numeric_limits<float>::infinity();
+                    }
+                }
+                s_tile[local_q_idx][k_tile_col_idx] = current_s_val;
+            }
+        }
+        __syncthreads(); // Ensure all S_ij scores are computed.
+
+        // --- Online Softmax: Update Statistics and Output Accumulator ---
+        if (valid_q) {
+            // 1. Find maximum score in the current S_ij tile row (for this thread's Q_i).
             float block_max_s = -std::numeric_limits<float>::infinity();
-            // This reduction is simplified to be done by thread (0,0).
-            // In practice, a parallel reduction (e.g., using warp shuffles or shared memory) is more efficient.
-            if (threadIdx.x == 0 && threadIdx.y == 0) { 
-                for (int k_col = 0; k_col < T_c; ++k_col) {
-                    if (s_tile[q_tile_row_idx][k_col] > block_max_s) {
-                        block_max_s = s_tile[q_tile_row_idx][k_col];
-                    }
+            for (int k_col = 0; k_col < T_c; ++k_col) {
+                if (s_tile[local_q_idx][k_col] > block_max_s) {
+                    block_max_s = s_tile[local_q_idx][k_col];
                 }
+            }
+
+            // 2. Update global maximum m_i
+            float new_m_i = fmaxf(m_i, block_max_s);
+
+            // 3. Compute scaling factors for previous and current contributions
+            float exp_diff_old = expf(m_i - new_m_i);
+            float exp_diff_new = expf(block_max_s - new_m_i);
+
+            // 4. Compute sum of exp(s_ij - new_m_i) for current tile
+            float tile_sum = 0.0f;
+            for (int k_col = 0; k_col < T_c; ++k_col) {
+                tile_sum += expf(s_tile[local_q_idx][k_col] - new_m_i);
+            }
+
+            // 5. Update l_i (running sum for normalizer)
+            float new_l_i = exp_diff_old * l_i + tile_sum;
+
+            // 6. Update output accumulator o_i
+            // Scale previous contributions
+            for (int h_col = 0; h_col < actual_head_dim; ++h_col) {
+                o_i[h_col] *= exp_diff_old;
+            }
+
+            // Add new contributions: sum over k_col of P_ij * V_j
+            for (int k_col = 0; k_col < T_c; ++k_col) {
+                float p_ij = expf(s_tile[local_q_idx][k_col] - new_m_i);
+                for (int h_col = 0; h_col < actual_head_dim; ++h_col) {
+                    o_i[h_col] += p_ij * v_tile[k_col][h_col];
+                }
+            }
+
+            // 7. Update statistics
+            m_i = new_m_i;
+            l_i = new_l_i;
+        }
+        __syncthreads(); // Ensure all threads finish before next KV tile
+    } // End of KV tiles loop
+
+    // --- Final Output and Statistics ---
+    if (valid_q) {
+        // Normalize final output
+        float inv_l_i = 1.0f / l_i;
+        for (int h_col = 0; h_col < actual_head_dim; ++h_col) {
+            o_i[h_col] *= inv_l_i;
+        }
+
+        // Write output to global memory
+        for (int h_col = threadIdx.x; h_col < actual_head_dim; h_col += blockDim.x) {
+            O_acc[batch_idx][head_idx][q_abs_idx][h_col] = o_i[h_col];
+        }
+
+        // Write logsumexp (for backward pass)
+        if (threadIdx.x == 0) {
+            L_acc[batch_idx][head_idx][q_abs_idx] = m_i + logf(l_i);
+        }
+    }
             }
             // Broadcast block_max_s to all threads in the block.
             __shared__ float shared_block_max_s_val;
