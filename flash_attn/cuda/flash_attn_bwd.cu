@@ -23,9 +23,9 @@
 #define HEAD_DIM_MAX_BWD 64
 #endif
 
-constexpr int T_r_BWD_DEFAULT = T_r_BWD_DEFAULT;
-constexpr int T_c_BWD_DEFAULT = T_c_BWD_DEFAULT;
-constexpr int HEAD_DIM_MAX_BWD = HEAD_DIM_MAX_BWD;
+constexpr int T_r_BWD_DEFAULT_VAL = T_r_BWD_DEFAULT;
+constexpr int T_c_BWD_DEFAULT_VAL = T_c_BWD_DEFAULT;
+constexpr int HEAD_DIM_MAX_BWD_VAL = HEAD_DIM_MAX_BWD;
 
 /**
  * @brief CUDA kernel for the backward pass of FlashAttention.
@@ -418,7 +418,7 @@ void flash_attention_backward_cuda(
     TORCH_CHECK(dK.size(0) == batch_size && dK.size(1) == num_heads && dK.size(2) == seq_len_kv && dK.size(3) == head_dim, "dK shape mismatch");
     TORCH_CHECK(dV.size(0) == batch_size && dV.size(1) == num_heads && dV.size(2) == seq_len_kv && dV.size(3) == head_dim, "dV shape mismatch");
     
-    TORCH_CHECK(head_dim <= HEAD_DIM_MAX_BWD, "Head dimension exceeds compiled maximum for BWD kernel.");
+    TORCH_CHECK(head_dim <= HEAD_DIM_MAX_BWD_VAL, "Head dimension exceeds compiled maximum for BWD kernel.");
 
     // Note on gradient initialization:
     // dK and dV use atomicAdd in the kernel, so they MUST be zero-initialized by the caller (e.g., PyTorch's autograd engine).
@@ -434,7 +434,7 @@ void flash_attention_backward_cuda(
     // blockDim.x typically parallelizes over head_dim or columns of a tile (T_c).
     // blockDim.y typically parallelizes over rows of a tile (T_r or T_c rows).
 
-    dim3 num_blocks((seq_len_q + T_r_BWD_DEFAULT - 1) / T_r_BWD_DEFAULT, num_heads, batch_size);
+    dim3 num_blocks((seq_len_q + T_r_BWD_DEFAULT_VAL - 1) / T_r_BWD_DEFAULT_VAL, num_heads, batch_size);
 
     // Get packed tensor accessors for efficient element access in CUDA.
     auto Q_acc_packed = Q.packed_accessor32<float,4,torch::RestrictPtrTraits>();
@@ -450,20 +450,20 @@ void flash_attention_backward_cuda(
     // --- Dispatch to Templated Kernel based on Head Dimension ---
     // T_c values are reduced to manage shared memory usage.
     if (head_dim <= 32) {
-        flash_attention_backward_kernel<T_r_BWD_DEFAULT, T_c_BWD_DEFAULT, 32><<<num_blocks, threads_per_block>>>(
+        flash_attention_backward_kernel<T_r_BWD_DEFAULT_VAL, T_c_BWD_DEFAULT_VAL, 32><<<num_blocks, threads_per_block>>>(
             Q_acc_packed, K_acc_packed, V_acc_packed, O_acc_packed, dO_acc_packed, L_acc_packed, 
             dQ_acc_packed, dK_acc_packed, dV_acc_packed, is_causal, sm_scale);
     } else if (head_dim <= 64) {
-        flash_attention_backward_kernel<T_r_BWD_DEFAULT, T_c_BWD_DEFAULT, 64><<<num_blocks, threads_per_block>>>(
+        flash_attention_backward_kernel<T_r_BWD_DEFAULT_VAL, T_c_BWD_DEFAULT_VAL, 64><<<num_blocks, threads_per_block>>>(
             Q_acc_packed, K_acc_packed, V_acc_packed, O_acc_packed, dO_acc_packed, L_acc_packed, 
             dQ_acc_packed, dK_acc_packed, dV_acc_packed, is_causal, sm_scale);
-    } else if (head_dim <= HEAD_DIM_MAX_BWD) { // Max head dim supported by this build (128)
-        flash_attention_backward_kernel<T_r_BWD_DEFAULT, T_c_BWD_DEFAULT, HEAD_DIM_MAX_BWD><<<num_blocks, threads_per_block>>>(
+    } else if (head_dim <= HEAD_DIM_MAX_BWD_VAL) { // Max head dim supported by this build (128)
+        flash_attention_backward_kernel<T_r_BWD_DEFAULT_VAL, T_c_BWD_DEFAULT_VAL, HEAD_DIM_MAX_BWD_VAL><<<num_blocks, threads_per_block>>>(
             Q_acc_packed, K_acc_packed, V_acc_packed, O_acc_packed, dO_acc_packed, L_acc_packed, 
             dQ_acc_packed, dK_acc_packed, dV_acc_packed, is_causal, sm_scale);
     } else {
         // This case should be caught by the TORCH_CHECK for head_dim vs HEAD_DIM_MAX_BWD.
-        AT_ERROR("Unsupported head_dimension for BWD kernel: ", head_dim, ". Max compiled is ", HEAD_DIM_MAX_BWD);
+        AT_ERROR("Unsupported head_dimension for BWD kernel: ", head_dim, ". Max compiled is ", HEAD_DIM_MAX_BWD_VAL);
     }
     
     // Check for any CUDA errors during kernel launch.

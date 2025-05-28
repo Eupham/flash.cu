@@ -23,9 +23,9 @@
 #define HEAD_DIM_MAX 64
 #endif
 
-constexpr int T_r_DEFAULT = T_r_DEFAULT;
-constexpr int T_c_DEFAULT = T_c_DEFAULT;
-constexpr int HEAD_DIM_MAX = HEAD_DIM_MAX;
+constexpr int T_r_DEFAULT_VAL = T_r_DEFAULT;
+constexpr int T_c_DEFAULT_VAL = T_c_DEFAULT;
+constexpr int HEAD_DIM_MAX_VAL = HEAD_DIM_MAX;
 
 // Forward declaration for the backward pass CUDA dispatcher function.
 // The actual definition resides in flash_attn_bwd.cu.
@@ -335,7 +335,7 @@ void flash_attention_forward_cuda(
     TORCH_CHECK(O.size(0) == batch_size && O.size(1) == num_heads && O.size(2) == seq_len_q && O.size(3) == head_dim, "O shape mismatch with Q");
     TORCH_CHECK(L.size(0) == batch_size && L.size(1) == num_heads && L.size(2) == seq_len_q, "L shape mismatch");
 
-    TORCH_CHECK(head_dim <= HEAD_DIM_MAX, "Head dimension exceeds compiled maximum HEAD_DIM_MAX.");
+    TORCH_CHECK(head_dim <= HEAD_DIM_MAX_VAL, "Head dimension exceeds compiled maximum HEAD_DIM_MAX.");
     
     // --- Kernel Launch Configuration ---
     // Define thread block dimensions. These can be tuned.
@@ -349,7 +349,7 @@ void flash_attention_forward_cuda(
     // This configuration should be chosen carefully based on kernel's parallelization strategy.
 
     // Define grid dimensions. Each block processes T_r_DEFAULT rows of Q.
-    dim3 num_blocks((seq_len_q + T_r_DEFAULT - 1) / T_r_DEFAULT, num_heads, batch_size);
+    dim3 num_blocks((seq_len_q + T_r_DEFAULT_VAL - 1) / T_r_DEFAULT_VAL, num_heads, batch_size);
 
     // Get packed tensor accessors for efficient element access in CUDA.
     auto Q_acc = Q.packed_accessor32<float,4,torch::RestrictPtrTraits>();
@@ -361,17 +361,17 @@ void flash_attention_forward_cuda(
     // --- Dispatch to Templated Kernel based on Head Dimension ---
     // This allows using shared memory arrays sized at compile time via templates.
     if (head_dim <= 32) {
-         flash_attention_forward_kernel<T_r_DEFAULT, T_c_DEFAULT, 32><<<num_blocks, threads_per_block>>>(
+         flash_attention_forward_kernel<T_r_DEFAULT_VAL, T_c_DEFAULT_VAL, 32><<<num_blocks, threads_per_block>>>(
             Q_acc, K_acc, V_acc, O_acc, L_acc, is_causal, sm_scale);
     } else if (head_dim <= 64) {
-         flash_attention_forward_kernel<T_r_DEFAULT, T_c_DEFAULT, 64><<<num_blocks, threads_per_block>>>(
+         flash_attention_forward_kernel<T_r_DEFAULT_VAL, T_c_DEFAULT_VAL, 64><<<num_blocks, threads_per_block>>>(
             Q_acc, K_acc, V_acc, O_acc, L_acc, is_causal, sm_scale);
     } else if (head_dim <= 128) { // Corresponds to HEAD_DIM_MAX
-         flash_attention_forward_kernel<T_r_DEFAULT, T_c_DEFAULT, 128><<<num_blocks, threads_per_block>>>(
+         flash_attention_forward_kernel<T_r_DEFAULT_VAL, T_c_DEFAULT_VAL, 128><<<num_blocks, threads_per_block>>>(
             Q_acc, K_acc, V_acc, O_acc, L_acc, is_causal, sm_scale);
     } else {
         // This case should be caught by the TORCH_CHECK for head_dim vs HEAD_DIM_MAX.
-        AT_ERROR("Unsupported head_dimension: ", head_dim, ". Max supported by this build is ", HEAD_DIM_MAX);
+        AT_ERROR("Unsupported head_dimension: ", head_dim, ". Max supported by this build is ", HEAD_DIM_MAX_VAL);
     }
 
     // Check for any CUDA errors during kernel launch.
