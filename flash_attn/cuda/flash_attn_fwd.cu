@@ -11,9 +11,21 @@
 // T_c: Tile size along the key/value sequence length dimension.
 // HEAD_DIM_MAX: Maximum head dimension supported by kernel versions with fixed shared memory.
 //               Kernels are templated on HEAD_DIM, and this acts as an upper bound for dispatch.
-constexpr int T_r_DEFAULT = 64; 
-constexpr int T_c_DEFAULT = 64; 
-constexpr int HEAD_DIM_MAX = 128; 
+// Conservative shared memory defaults to avoid CUDA build errors on most GPUs.
+// These can be overwritten at compile time with -DT_r_DEFAULT=... etc.
+#ifndef T_r_DEFAULT
+#define T_r_DEFAULT 32
+#endif
+#ifndef T_c_DEFAULT
+#define T_c_DEFAULT 16
+#endif
+#ifndef HEAD_DIM_MAX
+#define HEAD_DIM_MAX 64
+#endif
+
+constexpr int T_r_DEFAULT = T_r_DEFAULT;
+constexpr int T_c_DEFAULT = T_c_DEFAULT;
+constexpr int HEAD_DIM_MAX = HEAD_DIM_MAX;
 
 // Forward declaration for the backward pass CUDA dispatcher function.
 // The actual definition resides in flash_attn_bwd.cu.

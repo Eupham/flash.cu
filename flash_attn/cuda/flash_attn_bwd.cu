@@ -11,9 +11,21 @@
 // T_c_BWD_DEFAULT: Tile size along the key/value sequence length dimension (columns of K/V processed per tile).
 // HEAD_DIM_MAX_BWD: Maximum head dimension supported by kernel versions with fixed shared memory.
 // Conservative defaults to avoid exceeding CUDA shared memory limits. You can increase these if your GPU allows.
-constexpr int T_r_BWD_DEFAULT = 32; 
-constexpr int T_c_BWD_DEFAULT = 16; 
-constexpr int HEAD_DIM_MAX_BWD = 64;
+// Conservative shared memory defaults to avoid CUDA build errors on most GPUs.
+// These can be overwritten at compile time with -DT_r_BWD_DEFAULT=... etc.
+#ifndef T_r_BWD_DEFAULT
+#define T_r_BWD_DEFAULT 32
+#endif
+#ifndef T_c_BWD_DEFAULT
+#define T_c_BWD_DEFAULT 16
+#endif
+#ifndef HEAD_DIM_MAX_BWD
+#define HEAD_DIM_MAX_BWD 64
+#endif
+
+constexpr int T_r_BWD_DEFAULT = T_r_BWD_DEFAULT;
+constexpr int T_c_BWD_DEFAULT = T_c_BWD_DEFAULT;
+constexpr int HEAD_DIM_MAX_BWD = HEAD_DIM_MAX_BWD;
 
 /**
  * @brief CUDA kernel for the backward pass of FlashAttention.
