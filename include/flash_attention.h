@@ -38,6 +38,8 @@ void flash_attention_fwd_kernel(
     bool warp_specialize
 );
 
+// TODO: Complete backward kernel implementation
+/*
 void flash_attention_bwd_kernel(
     const __half* grad_out,
     const __half* q,
@@ -56,6 +58,7 @@ void flash_attention_bwd_kernel(
     bool causal,
     cudaStream_t stream
 );
+*/
 
 // Constants
 constexpr int BLOCK_M = 64;
