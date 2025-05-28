@@ -1,4 +1,4 @@
-#include "flash_attention.h"
+#include "../include/flash_attention.h"
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <cooperative_groups.h>

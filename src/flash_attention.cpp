@@ -1,5 +1,5 @@
 #include <torch/extension.h>
-#include "flash_attention.h"
+#include "../include/flash_attention.h"
 
 torch::Tensor flash_attention_forward(
     torch::Tensor q,
