@@ -11,13 +11,13 @@
 // T_c: Tile size along the key/value sequence length dimension.
 // HEAD_DIM_MAX: Maximum head dimension supported by kernel versions with fixed shared memory.
 //               Kernels are templated on HEAD_DIM, and this acts as an upper bound for dispatch.
-// Conservative shared memory defaults to avoid CUDA build errors on most GPUs.
+// Optimized tile sizes similar to Triton implementations
 // These can be overwritten at compile time with -DT_r_DEFAULT=... etc.
 #ifndef T_r_DEFAULT
-#define T_r_DEFAULT 32
+#define T_r_DEFAULT 64
 #endif
 #ifndef T_c_DEFAULT
-#define T_c_DEFAULT 32
+#define T_c_DEFAULT 64
 #endif
 #ifndef HEAD_DIM_MAX
 #define HEAD_DIM_MAX 128
@@ -39,12 +39,13 @@ void flash_attention_backward_cuda(
 );
 
 /**
- * @brief CUDA kernel for the forward pass of FlashAttention.
+ * @brief CUDA kernel for FlashAttention forward pass - Triton-style implementation.
  * 
- * Exact implementation following the reference pattern for optimal performance.
- * This kernel uses raw pointers and simple indexing for maximum efficiency.
+ * Based on Alex Dremov's blog post: each job loads a single Q tile, 
+ * iterates over all tiles in K and V, and accumulates the result.
+ * This follows the exact algorithm from the blog with proper online softmax.
  */
-template <int Bc, int Br, int HEAD_DIM>
+template <int BLOCK_M, int BLOCK_N, int HEAD_DIM>
 __global__ void flash_attention_forward_kernel(
     const float* Q, const float* K, const float* V, 
     const int N, const int d,
@@ -53,104 +54,150 @@ __global__ void flash_attention_forward_kernel(
     float* l, float* m, float* O,
     bool is_causal
 ) {
-    int tx = threadIdx.x;
-    int bx = blockIdx.x; 
-    int by = blockIdx.y;  // batch and head index
+    // Each block processes one Q tile (BLOCK_M rows)
+    int batch_head_idx = blockIdx.x * gridDim.y + blockIdx.y;
+    int q_block_idx = blockIdx.z;  // Which Q tile this block processes
+    int tid = threadIdx.x;
+    
+    // Calculate offsets for this batch/head
+    int qkv_offset = batch_head_idx * N * d;
+    int lm_offset = batch_head_idx * N;
+    int q_offset = q_block_idx * BLOCK_M;
 
-    // Offset into Q,K,V,O,l,m - different for each batch and head
-    int qkv_offset = (bx * gridDim.y * N * d) + (by * N * d);  // gridDim.y = nh
-    int lm_offset = (bx * gridDim.y * N) + (by * N);  // offset for l and m
-
-    // Define SRAM for Q,K,V,S
+    // Shared memory layout
     extern __shared__ float sram[];
-    int tile_size = Bc * d;  // size of Qi, Kj, Vj
-    float* Qi = sram;
-    float* Kj = &sram[tile_size];
-    float* Vj = &sram[tile_size * 2];
-    float* S = &sram[tile_size * 3];
+    float* q_tile = sram;                                    // [BLOCK_M, HEAD_DIM]
+    float* k_tile = sram + BLOCK_M * HEAD_DIM;               // [BLOCK_N, HEAD_DIM] 
+    float* v_tile = k_tile + BLOCK_N * HEAD_DIM;             // [BLOCK_N, HEAD_DIM]
+    float* s_tile = v_tile + BLOCK_N * HEAD_DIM;             // [BLOCK_M, BLOCK_N]
 
-    for (int j = 0; j < Tc; j++) {
+    // Load Q tile once (this block's responsibility)
+    for (int i = tid; i < BLOCK_M * HEAD_DIM; i += blockDim.x) {
+        int row = i / HEAD_DIM;
+        int col = i % HEAD_DIM;
+        int global_row = q_offset + row;
+        
+        if (global_row < N && col < d) {
+            q_tile[row * HEAD_DIM + col] = Q[qkv_offset + global_row * d + col];
+        } else {
+            q_tile[row * HEAD_DIM + col] = 0.0f;
+        }
+    }
+    __syncthreads();
 
-        // Load Kj, Vj to SRAM
-        for (int x = 0; x < d; x++) {
-            int kv_idx = j * Bc + tx;
-            if (kv_idx < N) {
-                Kj[(tx * d) + x] = K[qkv_offset + (kv_idx * d) + x];
-                Vj[(tx * d) + x] = V[qkv_offset + (kv_idx * d) + x];
+    // Initialize running statistics per thread (each thread handles one Q row)
+    float m_i = -INFINITY;  // running max
+    float l_i = 0.0f;       // running softmax denominator  
+    float acc[HEAD_DIM];    // accumulator for output
+    
+    // Initialize accumulator to zero
+    if (tid < BLOCK_M) {
+        #pragma unroll
+        for (int d_idx = 0; d_idx < HEAD_DIM; d_idx++) {
+            acc[d_idx] = 0.0f;
+        }
+    }
+
+    // Iterate over all K/V tiles (following Triton approach)
+    for (int kv_tile_idx = 0; kv_tile_idx < Tc; kv_tile_idx++) {
+        int kv_offset = kv_tile_idx * BLOCK_N;
+        
+        // Load K and V tiles cooperatively
+        for (int i = tid; i < BLOCK_N * HEAD_DIM; i += blockDim.x) {
+            int row = i / HEAD_DIM;
+            int col = i % HEAD_DIM;
+            int global_row = kv_offset + row;
+            
+            if (global_row < N && col < d) {
+                k_tile[row * HEAD_DIM + col] = K[qkv_offset + global_row * d + col];
+                v_tile[row * HEAD_DIM + col] = V[qkv_offset + global_row * d + col];
             } else {
-                Kj[(tx * d) + x] = 0.0f;
-                Vj[(tx * d) + x] = 0.0f;
+                k_tile[row * HEAD_DIM + col] = 0.0f;
+                v_tile[row * HEAD_DIM + col] = 0.0f;
             }
         }
-        __syncthreads();  // such that the inner loop can use the correct Kj, Vj
+        __syncthreads();
 
-        for (int i = 0; i < Tr; i++)  {
+        // Each thread processes one Q row
+        if (tid < BLOCK_M) {
+            int q_idx = q_offset + tid;
+            if (q_idx >= N) continue;
 
-            // Load Qi to SRAM, l and m to registers
-            for (int x = 0; x < d; x++) {
-                int q_idx = i * Br + tx;
-                if (q_idx < N) {
-                    Qi[(tx * d) + x] = Q[qkv_offset + (q_idx * d) + x];
-                } else {
-                    Qi[(tx * d) + x] = 0.0f;
+            // Compute QK^T for this Q row
+            float m_ij = -INFINITY;  // max of current tile
+            for (int k_idx = 0; k_idx < BLOCK_N; k_idx++) {
+                float qk_val = 0.0f;
+                
+                // Dot product: Q[tid] @ K[k_idx]
+                #pragma unroll
+                for (int d_idx = 0; d_idx < HEAD_DIM; d_idx++) {
+                    qk_val += q_tile[tid * HEAD_DIM + d_idx] * k_tile[k_idx * HEAD_DIM + d_idx];
                 }
+                
+                qk_val *= softmax_scale;
+                
+                // Apply causal mask
+                if (is_causal) {
+                    int global_k_idx = kv_offset + k_idx;
+                    if (global_k_idx > q_idx) {
+                        qk_val = -INFINITY;
+                    }
+                }
+                
+                s_tile[tid * BLOCK_N + k_idx] = qk_val;
+                m_ij = fmaxf(m_ij, qk_val);
+            }
+
+            // Online softmax update (following the blog's formulas)
+            float m_new = fmaxf(m_i, m_ij);
+            float alpha = __expf(m_i - m_new);
+            
+            // Compute probabilities and sum for current tile
+            float l_ij = 0.0f;
+            for (int k_idx = 0; k_idx < BLOCK_N; k_idx++) {
+                float p_val = __expf(s_tile[tid * BLOCK_N + k_idx] - m_new);
+                s_tile[tid * BLOCK_N + k_idx] = p_val;
+                l_ij += p_val;
             }
             
-            int q_idx = i * Br + tx;
-            float row_m_prev = (q_idx < N) ? m[lm_offset + q_idx] : -INFINITY;
-            float row_l_prev = (q_idx < N) ? l[lm_offset + q_idx] : 0.0f;
+            // Update denominator: l(x) = e^(m(x1) - m(x)) * l(x1) + l(x2)
+            float l_new = alpha * l_i + l_ij;
 
-            // S = QK^T, row_m = rowmax(S)
-            float row_m = -INFINITY;
-            for (int y = 0; y < Bc; y++) {
-                float sum = 0;
-                for (int x = 0; x < d; x++) {
-                    sum += Qi[(tx * d) + x] * Kj[(y * d) + x];
-                }
-                sum *= softmax_scale;
+            // Update accumulator: acc = alpha * acc + P @ V
+            #pragma unroll
+            for (int d_idx = 0; d_idx < HEAD_DIM; d_idx++) {
+                // Scale previous accumulator
+                acc[d_idx] *= alpha;
                 
-                // Apply causal mask if needed
-                if (is_causal) {
-                    int k_idx = j * Bc + y;
-                    if (k_idx > q_idx) {
-                        sum = -INFINITY;
-                    }
+                // Add P @ V for current tile
+                float pv = 0.0f;
+                for (int k_idx = 0; k_idx < BLOCK_N; k_idx++) {
+                    pv += s_tile[tid * BLOCK_N + k_idx] * v_tile[k_idx * HEAD_DIM + d_idx];
                 }
-                
-                S[(Bc * tx) + y] = sum;
-
-                if (sum > row_m)
-                    row_m = sum;
+                acc[d_idx] += pv;
             }
 
-            // P = exp(S - row_m), row_l = rowsum(P)
-            float row_l = 0;
-            for (int y = 0; y < Bc; y++) {
-                S[(Bc * tx) + y] = __expf(S[(Bc * tx) + y] - row_m);
-                row_l += S[(Bc * tx) + y];
-            }
-
-            // Compute new m and l
-            float row_m_new = fmaxf(row_m_prev, row_m);
-            float row_l_new = (__expf(row_m_prev - row_m_new) * row_l_prev) + (__expf(row_m - row_m_new) * row_l);
-
-            // Write O, l, m to HBM
-            if (q_idx < N) {
-                for (int x = 0; x < d; x++) {
-                    float pv = 0;  // Pij * Vj
-                    for (int y = 0; y < Bc; y++) {
-                        pv += S[(Bc * tx) + y] * Vj[(y * d) + x];
-                    }
-                    float prev_o = O[qkv_offset + (q_idx * d) + x];
-                    O[qkv_offset + (q_idx * d) + x] = (1.0f / row_l_new) * 
-                        ((row_l_prev * __expf(row_m_prev - row_m_new) * prev_o) + 
-                         (__expf(row_m - row_m_new) * pv));
-                }
-                m[lm_offset + q_idx] = row_m_new;
-                l[lm_offset + q_idx] = row_l_new;
-            }
+            // Update running statistics
+            m_i = m_new;
+            l_i = l_new;
         }
-        __syncthreads();  // otherwise, thread can use the wrong Kj, Vj in inner loop
+        __syncthreads();
+    }
+
+    // Final normalization and write output
+    if (tid < BLOCK_M) {
+        int q_idx = q_offset + tid;
+        if (q_idx < N) {
+            // Normalize by softmax denominator
+            #pragma unroll
+            for (int d_idx = 0; d_idx < HEAD_DIM; d_idx++) {
+                O[qkv_offset + q_idx * d + d_idx] = acc[d_idx] / l_i;
+            }
+            
+            // Store running statistics
+            m[lm_offset + q_idx] = m_i;
+            l[lm_offset + q_idx] = l_i;
+        }
     }
 }
 
@@ -219,21 +266,31 @@ void flash_attention_forward_cuda(
 
     TORCH_CHECK(head_dim <= HEAD_DIM_MAX_VAL, "Head dimension exceeds compiled maximum HEAD_DIM_MAX.");
     
-    // --- Kernel Launch Configuration (based on reference) ---
-    const int Bc = T_c_DEFAULT_VAL;  // Use Bc for block size like reference
-    const int Br = T_r_DEFAULT_VAL;  // Use Br for block size like reference
+    // --- Kernel Launch Configuration (Triton-style: one block per Q tile) ---
+    const int BLOCK_M = 32;  // Smaller tile sizes to fit in shared memory
+    const int BLOCK_N = 32;
     
-    // Calculate Tc and Tr like in the reference
-    const int Tc = (seq_len_q + Bc - 1) / Bc;
-    const int Tr = (seq_len_q + Br - 1) / Br;
+    // Calculate number of blocks needed
+    const int Tc = (seq_len_kv + BLOCK_N - 1) / BLOCK_N;  // Number of K/V tiles
+    const int Tr = (seq_len_q + BLOCK_M - 1) / BLOCK_M;   // Number of Q tiles
     
-    dim3 grid_dim(batch_size, num_heads);   // batch_size x num_heads
-    dim3 block_dim(Bc);                     // Bc threads per block
-
+    // Grid configuration: (batch_size, num_heads, num_Q_tiles)
+    // Each block processes one Q tile, iterates through all K/V tiles
+    dim3 grid_dim(batch_size, num_heads, Tr);
+    dim3 block_dim(BLOCK_M);  // One thread per Q row in the tile
+    
     // Calculate shared memory size needed
-    const int sram_size = (3 * Bc * head_dim * sizeof(float)) + (Bc * Br * sizeof(float));
+    // q_tile: BLOCK_M * head_dim, k_tile: BLOCK_N * head_dim, v_tile: BLOCK_N * head_dim
+    // s_tile: BLOCK_M * BLOCK_N (for attention scores)
+    const int sram_size = ((BLOCK_M + 2 * BLOCK_N) * head_dim + BLOCK_M * BLOCK_N) * sizeof(float);
     
-    // Get raw pointers like the reference
+    // Ensure we don't exceed shared memory limits
+    int max_sram_size;
+    cudaDeviceGetAttribute(&max_sram_size, cudaDevAttrMaxSharedMemoryPerBlock, 0);
+    TORCH_CHECK(sram_size <= max_sram_size, 
+                "Shared memory requirement (", sram_size, " bytes) exceeds device limit (", max_sram_size, " bytes)");
+    
+    // Get raw pointers
     const float* Q_ptr = Q.data_ptr<float>();
     const float* K_ptr = K.data_ptr<float>();
     const float* V_ptr = V.data_ptr<float>();
@@ -242,18 +299,16 @@ void flash_attention_forward_cuda(
     float* M_ptr = M.data_ptr<float>();
     
     // --- Dispatch to Templated Kernel based on Head Dimension ---
-    // This allows using shared memory arrays sized at compile time via templates.
     if (head_dim <= 32) {
          flash_attention_forward_kernel<32, 32, 32><<<grid_dim, block_dim, sram_size>>>(
             Q_ptr, K_ptr, V_ptr, seq_len_q, head_dim, Tc, Tr, sm_scale, L_ptr, M_ptr, O_ptr, is_causal);
     } else if (head_dim <= 64) {
          flash_attention_forward_kernel<32, 32, 64><<<grid_dim, block_dim, sram_size>>>(
             Q_ptr, K_ptr, V_ptr, seq_len_q, head_dim, Tc, Tr, sm_scale, L_ptr, M_ptr, O_ptr, is_causal);
-    } else if (head_dim <= 128) { // Corresponds to HEAD_DIM_MAX
+    } else if (head_dim <= 128) {
          flash_attention_forward_kernel<32, 32, 128><<<grid_dim, block_dim, sram_size>>>(
             Q_ptr, K_ptr, V_ptr, seq_len_q, head_dim, Tc, Tr, sm_scale, L_ptr, M_ptr, O_ptr, is_causal);
     } else {
-        // This case should be caught by the TORCH_CHECK for head_dim vs HEAD_DIM_MAX.
         AT_ERROR("Unsupported head_dimension: ", head_dim, ". Max supported by this build is ", HEAD_DIM_MAX_VAL);
     }
 
