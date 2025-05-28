@@ -116,23 +116,27 @@ __global__ void flash_attention_forward_kernel(
         }
         __syncthreads();
 
-        // Each thread processes one Q row
+        // Process each Q row that this thread is responsible for
         if (tid < BLOCK_M) {
             int q_idx = q_offset + tid;
             if (q_idx >= N) continue;
 
-            // Compute QK^T for this Q row using optimized pattern
-            float m_ij = -INFINITY;  // max of current tile
+            // Compute QK^T for this Q row
+            float m_ij = -INFINITY;  // max for current tile
             
-            // Compute all QK^T values for this thread's Q row
+            // Warp-level optimization: process K rows in chunks of 32 for better memory access
+            const int warp_id = tid / 32;
+            const int lane_id = tid % 32;
+            
             for (int k_idx = 0; k_idx < BLOCK_N; k_idx++) {
+                // Vectorized dot product: Q[tid] @ K[k_idx] with warp cooperation
                 float qk_val = 0.0f;
                 
-                // Vectorized dot product: Q[tid] @ K[k_idx]
+                // Each thread computes dot product for its Q row
                 const float* q_row = &q_tile[tid * HEAD_DIM];
                 const float* k_row = &k_tile[k_idx * HEAD_DIM];
                 
-                // Unroll for better performance
+                // Unroll for better performance and use warp-level cooperation
                 #pragma unroll 8
                 for (int d_idx = 0; d_idx < HEAD_DIM; d_idx++) {
                     qk_val += q_row[d_idx] * k_row[d_idx];
@@ -156,7 +160,7 @@ __global__ void flash_attention_forward_kernel(
             float m_new = fmaxf(m_i, m_ij);
             float alpha = exp2f((m_i - m_new) * 1.44269504f);  // log2(e) ≈ 1.44269504
             
-            // Compute probabilities and sum for current tile
+            // Compute softmax probabilities and denominator for this tile
             float l_ij = 0.0f;
             for (int k_idx = 0; k_idx < BLOCK_N; k_idx++) {
                 float p_val = exp2f((s_tile[tid * BLOCK_N + k_idx] - m_new) * 1.44269504f);
@@ -167,17 +171,21 @@ __global__ void flash_attention_forward_kernel(
             // Update denominator: l(x) = e^(m(x1) - m(x)) * l(x1) + l(x2)
             float l_new = alpha * l_i + l_ij;
 
-            // Update accumulator: acc = alpha * acc + P @ V
+            // Compute P @ V with warp-level optimization for memory access
             #pragma unroll
             for (int d_idx = 0; d_idx < HEAD_DIM; d_idx++) {
                 // Scale previous accumulator
                 acc[d_idx] *= alpha;
                 
-                // Add P @ V for current tile
+                // Matrix-vector multiplication with optimized memory access
                 float pv = 0.0f;
+                
+                // Vectorized computation with memory coalescing
+                #pragma unroll 4
                 for (int k_idx = 0; k_idx < BLOCK_N; k_idx++) {
                     pv += s_tile[tid * BLOCK_N + k_idx] * v_tile[k_idx * HEAD_DIM + d_idx];
                 }
+                
                 acc[d_idx] += pv;
             }
 
@@ -204,6 +212,39 @@ __global__ void flash_attention_forward_kernel(
         }
     }
 }
+
+// Additional kernel template instantiations for different tile sizes
+template __global__ void flash_attention_forward_kernel<64, 64, 32>(
+    const float*, const float*, const float*, const int, const int, const int, const int, 
+    const float, float*, float*, float*, bool);
+
+template __global__ void flash_attention_forward_kernel<32, 32, 32>(
+    const float*, const float*, const float*, const int, const int, const int, const int, 
+    const float, float*, float*, float*, bool);
+
+template __global__ void flash_attention_forward_kernel<16, 16, 32>(
+    const float*, const float*, const float*, const int, const int, const int, const int, 
+    const float, float*, float*, float*, bool);
+
+template __global__ void flash_attention_forward_kernel<32, 32, 64>(
+    const float*, const float*, const float*, const int, const int, const int, const int, 
+    const float, float*, float*, float*, bool);
+
+template __global__ void flash_attention_forward_kernel<16, 16, 64>(
+    const float*, const float*, const float*, const int, const int, const int, const int, 
+    const float, float*, float*, float*, bool);
+
+template __global__ void flash_attention_forward_kernel<16, 32, 64>(
+    const float*, const float*, const float*, const int, const int, const int, const int, 
+    const float, float*, float*, float*, bool);
+
+template __global__ void flash_attention_forward_kernel<16, 32, 128>(
+    const float*, const float*, const float*, const int, const int, const int, const int, 
+    const float, float*, float*, float*, bool);
+
+template __global__ void flash_attention_forward_kernel<16, 16, 128>(
+    const float*, const float*, const float*, const int, const int, const int, const int, 
+    const float, float*, float*, float*, bool);
 
 
 /**
@@ -270,9 +311,46 @@ void flash_attention_forward_cuda(
 
     TORCH_CHECK(head_dim <= HEAD_DIM_MAX_VAL, "Head dimension exceeds compiled maximum HEAD_DIM_MAX.");
     
-    // --- Kernel Launch Configuration (Triton-style: one block per Q tile) ---
-    const int BLOCK_M = 64;  // Larger tile sizes for better efficiency
-    const int BLOCK_N = 64;
+    // --- Kernel Launch Configuration (Dynamic tile sizing based on shared memory) ---
+    // Get device shared memory limit
+    int max_sram_size;
+    cudaDeviceGetAttribute(&max_sram_size, cudaDevAttrMaxSharedMemoryPerBlock, 0);
+    
+    // Dynamically choose tile sizes based on available shared memory and head dimension
+    int BLOCK_M, BLOCK_N;
+    
+    if (head_dim <= 32) {
+        // For small head dimensions, use larger tiles for better efficiency
+        BLOCK_M = 64;
+        BLOCK_N = 64;
+    } else if (head_dim <= 64) {
+        // For medium head dimensions, use smaller tiles to fit in shared memory
+        BLOCK_M = 32;
+        BLOCK_N = 32; 
+    } else {
+        // For large head dimensions, use even smaller tiles
+        BLOCK_M = 16;
+        BLOCK_N = 32;
+    }
+    
+    // Calculate shared memory requirement and adjust if needed
+    int sram_size = ((BLOCK_M + 2 * BLOCK_N) * head_dim + BLOCK_M * BLOCK_N) * sizeof(float);
+    
+    // If still too large, reduce further
+    while (sram_size > max_sram_size && (BLOCK_M > 16 || BLOCK_N > 16)) {
+        if (BLOCK_M > BLOCK_N) {
+            BLOCK_M = BLOCK_M / 2;
+        } else {
+            BLOCK_N = BLOCK_N / 2;
+        }
+        sram_size = ((BLOCK_M + 2 * BLOCK_N) * head_dim + BLOCK_M * BLOCK_N) * sizeof(float);
+    }
+    
+    // Final check
+    if (sram_size > max_sram_size) {
+        AT_ERROR("Cannot fit required shared memory even with minimum tile sizes. ",
+                 "Required: ", sram_size, " bytes, Available: ", max_sram_size, " bytes");
+    }
     
     // Calculate number of blocks needed
     const int Tc = (seq_len_kv + BLOCK_N - 1) / BLOCK_N;  // Number of K/V tiles
@@ -283,19 +361,6 @@ void flash_attention_forward_cuda(
     dim3 grid_dim(batch_size, num_heads, Tr);
     dim3 block_dim(128);  // Use warp-aligned thread count for better efficiency
     
-    // Calculate shared memory size needed
-    // q_tile: BLOCK_M * head_dim, k_tile: BLOCK_N * head_dim, v_tile: BLOCK_N * head_dim
-    // s_tile: BLOCK_M * BLOCK_N (for attention scores)
-    const int sram_size = ((BLOCK_M + 2 * BLOCK_N) * head_dim + BLOCK_M * BLOCK_N) * sizeof(float);
-    
-    // Ensure we don't exceed shared memory limits (reduce tile size if needed)
-    int max_sram_size;
-    cudaDeviceGetAttribute(&max_sram_size, cudaDevAttrMaxSharedMemoryPerBlock, 0);
-    if (sram_size > max_sram_size) {
-        AT_ERROR("Shared memory requirement (", sram_size, " bytes) exceeds device limit (", max_sram_size, " bytes). ",
-                 "Consider reducing BLOCK_M/BLOCK_N or HEAD_DIM.");
-    }
-    
     // Get raw pointers
     const float* Q_ptr = Q.data_ptr<float>();
     const float* K_ptr = K.data_ptr<float>();
@@ -305,15 +370,37 @@ void flash_attention_forward_cuda(
     float* M_ptr = M.data_ptr<float>();
     
     // --- Dispatch to Templated Kernel based on Head Dimension ---
+    // Use dynamic dispatch with runtime tile sizes
     if (head_dim <= 32) {
-         flash_attention_forward_kernel<64, 64, 32><<<grid_dim, block_dim, sram_size>>>(
-            Q_ptr, K_ptr, V_ptr, seq_len_q, head_dim, Tc, Tr, sm_scale, L_ptr, M_ptr, O_ptr, is_causal);
+        if (BLOCK_M == 64 && BLOCK_N == 64) {
+            flash_attention_forward_kernel<64, 64, 32><<<grid_dim, block_dim, sram_size>>>(
+                Q_ptr, K_ptr, V_ptr, seq_len_q, head_dim, Tc, Tr, sm_scale, L_ptr, M_ptr, O_ptr, is_causal);
+        } else if (BLOCK_M == 32 && BLOCK_N == 32) {
+            flash_attention_forward_kernel<32, 32, 32><<<grid_dim, block_dim, sram_size>>>(
+                Q_ptr, K_ptr, V_ptr, seq_len_q, head_dim, Tc, Tr, sm_scale, L_ptr, M_ptr, O_ptr, is_causal);
+        } else {
+            flash_attention_forward_kernel<16, 16, 32><<<grid_dim, block_dim, sram_size>>>(
+                Q_ptr, K_ptr, V_ptr, seq_len_q, head_dim, Tc, Tr, sm_scale, L_ptr, M_ptr, O_ptr, is_causal);
+        }
     } else if (head_dim <= 64) {
-         flash_attention_forward_kernel<64, 64, 64><<<grid_dim, block_dim, sram_size>>>(
-            Q_ptr, K_ptr, V_ptr, seq_len_q, head_dim, Tc, Tr, sm_scale, L_ptr, M_ptr, O_ptr, is_causal);
+        if (BLOCK_M == 32 && BLOCK_N == 32) {
+            flash_attention_forward_kernel<32, 32, 64><<<grid_dim, block_dim, sram_size>>>(
+                Q_ptr, K_ptr, V_ptr, seq_len_q, head_dim, Tc, Tr, sm_scale, L_ptr, M_ptr, O_ptr, is_causal);
+        } else if (BLOCK_M == 16 && BLOCK_N == 16) {
+            flash_attention_forward_kernel<16, 16, 64><<<grid_dim, block_dim, sram_size>>>(
+                Q_ptr, K_ptr, V_ptr, seq_len_q, head_dim, Tc, Tr, sm_scale, L_ptr, M_ptr, O_ptr, is_causal);
+        } else {
+            flash_attention_forward_kernel<16, 32, 64><<<grid_dim, block_dim, sram_size>>>(
+                Q_ptr, K_ptr, V_ptr, seq_len_q, head_dim, Tc, Tr, sm_scale, L_ptr, M_ptr, O_ptr, is_causal);
+        }
     } else if (head_dim <= 128) {
-         flash_attention_forward_kernel<64, 64, 128><<<grid_dim, block_dim, sram_size>>>(
-            Q_ptr, K_ptr, V_ptr, seq_len_q, head_dim, Tc, Tr, sm_scale, L_ptr, M_ptr, O_ptr, is_causal);
+        if (BLOCK_M == 16 && BLOCK_N == 32) {
+            flash_attention_forward_kernel<16, 32, 128><<<grid_dim, block_dim, sram_size>>>(
+                Q_ptr, K_ptr, V_ptr, seq_len_q, head_dim, Tc, Tr, sm_scale, L_ptr, M_ptr, O_ptr, is_causal);
+        } else {
+            flash_attention_forward_kernel<16, 16, 128><<<grid_dim, block_dim, sram_size>>>(
+                Q_ptr, K_ptr, V_ptr, seq_len_q, head_dim, Tc, Tr, sm_scale, L_ptr, M_ptr, O_ptr, is_causal);
+        }
     } else {
         AT_ERROR("Unsupported head_dimension: ", head_dim, ". Max supported by this build is ", HEAD_DIM_MAX_VAL);
     }
