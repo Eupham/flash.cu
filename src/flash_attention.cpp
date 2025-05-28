@@ -1,6 +1,9 @@
 #include <torch/extension.h>
 #include "../include/flash_attention.h"
 
+// Constants from header
+constexpr int BLOCK_M = 64;
+
 torch::Tensor flash_attention_forward(
     torch::Tensor q,
     torch::Tensor k,
@@ -34,12 +37,20 @@ torch::Tensor flash_attention_forward(
     __half* out_ptr = reinterpret_cast<__half*>(out.data_ptr<at::Half>());
     float* lse_ptr = softmax_lse.data_ptr<float>();
     
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     
-    flash_attention_fwd_kernel(
+    // Determine STAGE based on causal flag
+    int STAGE = causal ? 3 : 1;  // 3 = both stages for causal, 1 = non-causal
+    bool warp_specialize = false;
+    
+    // Call kernel with proper grid configuration
+    dim3 grid((seq_len + BLOCK_M - 1) / BLOCK_M, batch_size * num_heads);
+    dim3 block(256);  // Sufficient threads for BLOCK_M=64
+    
+    flash_attention_fwd_kernel<<<grid, block, 0, stream>>>(
         q_ptr, k_ptr, v_ptr, out_ptr, lse_ptr,
-        batch_size, num_heads, seq_len, head_dim,
-        scale, causal, stream
+        scale, batch_size, num_heads, seq_len, head_dim,
+        STAGE, warp_specialize
     );
     
     return out;
@@ -79,7 +90,7 @@ std::vector<torch::Tensor> flash_attention_backward(
     __half* grad_k_ptr = reinterpret_cast<__half*>(grad_k.data_ptr<at::Half>());
     __half* grad_v_ptr = reinterpret_cast<__half*>(grad_v.data_ptr<at::Half>());
     
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     
     flash_attention_bwd_kernel(
         grad_out_ptr, q_ptr, k_ptr, v_ptr, out_ptr, lse_ptr,

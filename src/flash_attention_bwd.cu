@@ -4,35 +4,260 @@
 
 namespace cg = cooperative_groups;
 
-template<int BLOCK_M, int BLOCK_N, int HEAD_DIM>
-struct BackwardSharedMemory {
-    __half q_smem[BLOCK_M][HEAD_DIM];
-    __half k_smem[BLOCK_N][HEAD_DIM];
-    __half v_smem[BLOCK_N][HEAD_DIM];
-    __half do_smem[BLOCK_M][HEAD_DIM];
-    __half o_smem[BLOCK_M][HEAD_DIM];
-    float qk_smem[BLOCK_M][BLOCK_N];
-    float softmax_smem[BLOCK_M][BLOCK_N];
-    float delta_smem[BLOCK_M];
-};
+// Delta preprocessing kernel following Triton's _attn_bwd_preprocess
+template<int BLOCK_M, int HEAD_DIM>
+__global__ void attn_bwd_preprocess_kernel(
+    const __half* __restrict__ O,
+    const __half* __restrict__ DO,
+    float* __restrict__ Delta,
+    int Z, int H, int N_CTX) {
+    
+    int off_m = blockIdx.x * BLOCK_M + threadIdx.x;
+    int off_hz = blockIdx.y;
+    
+    if (off_m >= N_CTX) return;
+    
+    // Load O and DO
+    float delta = 0.0f;
+    for (int d = 0; d < HEAD_DIM; ++d) {
+        int idx = off_hz * HEAD_DIM * N_CTX + off_m * HEAD_DIM + d;
+        float o_val = __half2float(O[idx]);
+        float do_val = __half2float(DO[idx]);
+        delta += o_val * do_val;
+    }
+    
+    // Store delta
+    Delta[off_hz * N_CTX + off_m] = delta;
+}
 
-template<int BLOCK_M, int BLOCK_N, int HEAD_DIM>
+// Device function following Triton's _attn_bwd_dkdv
+template<int BLOCK_M1, int BLOCK_N1, int HEAD_DIM>
+__device__ void attn_bwd_dkdv(
+    float* dk, float* dv,
+    const __half* Q, const __half* k, const __half* v, float sm_scale,
+    const __half* DO,
+    const float* M, const float* D,
+    int stride_tok, int stride_d,
+    int H, int N_CTX,
+    int start_n, int start_m, int num_steps,
+    bool MASK) {
+    
+    const float LN2 = 0.6931471824645996f; // ln(2)
+    
+    for (int blk_idx = 0; blk_idx < num_steps; ++blk_idx) {
+        int curr_m = start_m + blk_idx * BLOCK_M1;
+        
+        // Load Q transpose and DO
+        __half qT[HEAD_DIM][BLOCK_M1];
+        __half do_vals[BLOCK_M1][HEAD_DIM];
+        
+        for (int i = 0; i < BLOCK_M1; ++i) {
+            if (curr_m + i < N_CTX) {
+                for (int d = 0; d < HEAD_DIM; ++d) {
+                    int q_idx = (curr_m + i) * stride_tok + d * stride_d;
+                    qT[d][i] = Q[q_idx];
+                    do_vals[i][d] = DO[(curr_m + i) * stride_tok + d * stride_d];
+                }
+            }
+        }
+        
+        // Load m (LSE values)
+        float m_vals[BLOCK_M1];
+        for (int i = 0; i < BLOCK_M1; ++i) {
+            if (curr_m + i < N_CTX) {
+                m_vals[i] = M[curr_m + i];
+            }
+        }
+        
+        // Compute QK^T
+        float qkT[BLOCK_N1][BLOCK_M1];
+        for (int j = 0; j < BLOCK_N1; ++j) {
+            for (int i = 0; i < BLOCK_M1; ++i) {
+                qkT[j][i] = 0.0f;
+                for (int d = 0; d < HEAD_DIM; ++d) {
+                    int k_idx = (start_n + j) * stride_tok + d * stride_d;
+                    qkT[j][i] += __half2float(k[k_idx]) * __half2float(qT[d][i]);
+                }
+            }
+        }
+        
+        // Compute P^T = exp2(QK^T - m)
+        float pT[BLOCK_N1][BLOCK_M1];
+        for (int j = 0; j < BLOCK_N1; ++j) {
+            for (int i = 0; i < BLOCK_M1; ++i) {
+                pT[j][i] = exp2f(qkT[j][i] - m_vals[i]);
+                
+                // Apply causal mask
+                if (MASK && (curr_m + i) < (start_n + j)) {
+                    pT[j][i] = 0.0f;
+                }
+            }
+        }
+        
+        // Compute dV += P^T @ DO
+        for (int j = 0; j < BLOCK_N1; ++j) {
+            for (int d = 0; d < HEAD_DIM; ++d) {
+                float dv_val = 0.0f;
+                for (int i = 0; i < BLOCK_M1; ++i) {
+                    if (curr_m + i < N_CTX) {
+                        dv_val += pT[j][i] * __half2float(do_vals[i][d]);
+                    }
+                }
+                dv[j * HEAD_DIM + d] += dv_val;
+            }
+        }
+        
+        // Load D (delta) values
+        float Di[BLOCK_M1];
+        for (int i = 0; i < BLOCK_M1; ++i) {
+            if (curr_m + i < N_CTX) {
+                Di[i] = D[curr_m + i];
+            }
+        }
+        
+        // Compute dP^T = V @ DO^T
+        float dpT[BLOCK_N1][BLOCK_M1];
+        for (int j = 0; j < BLOCK_N1; ++j) {
+            for (int i = 0; i < BLOCK_M1; ++i) {
+                dpT[j][i] = 0.0f;
+                for (int d = 0; d < HEAD_DIM; ++d) {
+                    int v_idx = (start_n + j) * stride_tok + d * stride_d;
+                    if (curr_m + i < N_CTX) {
+                        dpT[j][i] += __half2float(v[v_idx]) * __half2float(do_vals[i][d]);
+                    }
+                }
+            }
+        }
+        
+        // Compute dS^T = P^T * (dP^T - D)
+        float dsT[BLOCK_N1][BLOCK_M1];
+        for (int j = 0; j < BLOCK_N1; ++j) {
+            for (int i = 0; i < BLOCK_M1; ++i) {
+                dsT[j][i] = pT[j][i] * (dpT[j][i] - Di[i]);
+            }
+        }
+        
+        // Compute dK += dS^T @ Q^T
+        for (int j = 0; j < BLOCK_N1; ++j) {
+            for (int d = 0; d < HEAD_DIM; ++d) {
+                float dk_val = 0.0f;
+                for (int i = 0; i < BLOCK_M1; ++i) {
+                    if (curr_m + i < N_CTX) {
+                        dk_val += dsT[j][i] * __half2float(qT[d][i]);
+                    }
+                }
+                dk[j * HEAD_DIM + d] += dk_val;
+            }
+        }
+    }
+}
+
+// Device function following Triton's _attn_bwd_dq
+template<int BLOCK_M2, int BLOCK_N2, int HEAD_DIM>
+__device__ void attn_bwd_dq(
+    float* dq,
+    const __half* q, const __half* K, const __half* V,
+    const __half* do_vals, const float* m, const float* D,
+    int stride_tok, int stride_d,
+    int H, int N_CTX,
+    int start_m, int start_n, int num_steps,
+    bool MASK) {
+    
+    for (int blk_idx = 0; blk_idx < num_steps; ++blk_idx) {
+        int curr_n = start_n + blk_idx * BLOCK_N2;
+        
+        // Load K^T and V^T
+        __half kT[HEAD_DIM][BLOCK_N2];
+        __half vT[HEAD_DIM][BLOCK_N2];
+        
+        for (int j = 0; j < BLOCK_N2; ++j) {
+            if (curr_n + j < N_CTX) {
+                for (int d = 0; d < HEAD_DIM; ++d) {
+                    int kv_idx = (curr_n + j) * stride_tok + d * stride_d;
+                    kT[d][j] = K[kv_idx];
+                    vT[d][j] = V[kv_idx];
+                }
+            }
+        }
+        
+        // Compute QK
+        float qk[BLOCK_M2][BLOCK_N2];
+        for (int i = 0; i < BLOCK_M2; ++i) {
+            for (int j = 0; j < BLOCK_N2; ++j) {
+                qk[i][j] = 0.0f;
+                for (int d = 0; d < HEAD_DIM; ++d) {
+                    int q_idx = (start_m + i) * stride_tok + d * stride_d;
+                    if (curr_n + j < N_CTX && start_m + i < N_CTX) {
+                        qk[i][j] += __half2float(q[q_idx]) * __half2float(kT[d][j]);
+                    }
+                }
+            }
+        }
+        
+        // Compute P = exp2(QK - m)
+        float p[BLOCK_M2][BLOCK_N2];
+        for (int i = 0; i < BLOCK_M2; ++i) {
+            for (int j = 0; j < BLOCK_N2; ++j) {
+                p[i][j] = exp2f(qk[i][j] - m[i]);
+                
+                // Apply causal mask
+                if (MASK && (start_m + i) < (curr_n + j)) {
+                    p[i][j] = 0.0f;
+                }
+            }
+        }
+        
+        // Compute dP = DO @ V^T
+        float dp[BLOCK_M2][BLOCK_N2];
+        for (int i = 0; i < BLOCK_M2; ++i) {
+            for (int j = 0; j < BLOCK_N2; ++j) {
+                dp[i][j] = 0.0f;
+                for (int d = 0; d < HEAD_DIM; ++d) {
+                    if (curr_n + j < N_CTX && start_m + i < N_CTX) {
+                        dp[i][j] += __half2float(do_vals[i * HEAD_DIM + d]) * __half2float(vT[d][j]);
+                    }
+                }
+            }
+        }
+        
+        // Compute dS = P * (dP - D)
+        float ds[BLOCK_M2][BLOCK_N2];
+        for (int i = 0; i < BLOCK_M2; ++i) {
+            for (int j = 0; j < BLOCK_N2; ++j) {
+                ds[i][j] = p[i][j] * (dp[i][j] - D[i]);
+            }
+        }
+        
+        // Compute dQ += dS @ K^T
+        for (int i = 0; i < BLOCK_M2; ++i) {
+            for (int d = 0; d < HEAD_DIM; ++d) {
+                float dq_val = 0.0f;
+                for (int j = 0; j < BLOCK_N2; ++j) {
+                    if (curr_n + j < N_CTX) {
+                        dq_val += ds[i][j] * __half2float(kT[d][j]);
+                    }
+                }
+                dq[i * HEAD_DIM + d] += dq_val;
+            }
+        }
+    }
+}
+
+// Main backward kernel following Triton's _attn_bwd
+template<int BLOCK_M1, int BLOCK_N1, int BLOCK_M2, int BLOCK_N2, int HEAD_DIM, int BLK_SLICE_FACTOR>
 __global__ void flash_attention_bwd_kernel_impl(
-    const __half* __restrict__ grad_out,
-    const __half* __restrict__ q,
-    const __half* __restrict__ k,
-    const __half* __restrict__ v,
-    const __half* __restrict__ out,
-    const float* __restrict__ softmax_lse,
-    __half* __restrict__ grad_q,
-    __half* __restrict__ grad_k,
-    __half* __restrict__ grad_v,
-    int batch_size,
-    int num_heads,
-    int seq_len,
-    int head_dim,
-    float scale,
-    bool causal) {
+    const __half* __restrict__ Q,
+    const __half* __restrict__ K,
+    const __half* __restrict__ V,
+    float sm_scale,
+    const __half* __restrict__ DO,
+    __half* __restrict__ DQ,
+    __half* __restrict__ DK,
+    __half* __restrict__ DV,
+    const float* __restrict__ M,
+    const float* __restrict__ D,
+    int stride_z, int stride_h, int stride_tok, int stride_d,
+    int H, int N_CTX) {
     
     extern __shared__ char smem_[];
     auto* smem = reinterpret_cast<BackwardSharedMemory<BLOCK_M, BLOCK_N, HEAD_DIM>*>(smem_);

@@ -27,18 +27,15 @@ std::vector<torch::Tensor> flash_attention_backward(
 
 // CUDA kernel declarations
 void flash_attention_fwd_kernel(
-    const __half* q,
-    const __half* k,
-    const __half* v,
-    __half* out,
-    float* softmax_lse,
-    int batch_size,
-    int num_heads,
-    int seq_len,
-    int head_dim,
-    float scale,
-    bool causal,
-    cudaStream_t stream
+    const __half* Q,
+    const __half* K,
+    const __half* V, 
+    __half* O,
+    float* M,
+    float sm_scale,
+    int Z, int H, int N_CTX, int HEAD_DIM,
+    int STAGE,
+    bool warp_specialize
 );
 
 void flash_attention_bwd_kernel(
