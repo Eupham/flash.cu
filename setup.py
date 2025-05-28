@@ -1,50 +1,91 @@
-from setuptools import setup, Extension
-from pybind11.setup_helpers import Pybind11Extension, build_ext
-from pybind11 import get_cmake_dir
-import pybind11
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-import torch
+# Setup script for Flash Attention implementations
+import subprocess
+import sys
+import os
 
-ext_modules = [
-    CUDAExtension(
-        name='flash_attention_cuda',
-        sources=[
-            'src/flash_attention.cpp',
-            'src/flash_attention_fwd.cu',
-            'src/flash_attention_bwd.cu',
-        ],
-        include_dirs=[
-            'include',
-        ],
-        extra_compile_args={
-            'cxx': ['-O3', '-std=c++17'],
-            'nvcc': [
-                '-O3',
-                '-std=c++17',
-                '--expt-relaxed-constexpr',
-                '--extended-lambda',
-                '--use_fast_math',
-                '-Xptxas=-v',
-                '--ptxas-options=-O3',
-                '-gencode=arch=compute_80,code=sm_80',  # Ampere
-                '-gencode=arch=compute_86,code=sm_86',  # Ampere
-                '-gencode=arch=compute_89,code=sm_89',  # Ada Lovelace
-                '-gencode=arch=compute_90,code=sm_90',  # Hopper
-            ]
-        }
-    )
-]
+def install_requirements():
+    """Install required packages"""
+    print("Installing requirements...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
 
-setup(
-    name='flash_attention_cuda',
-    version='0.1.0',
-    description='Flash Attention CUDA Implementation',
-    ext_modules=ext_modules,
-    cmdclass={'build_ext': BuildExtension},
-    zip_safe=False,
-    python_requires='>=3.8',
-    install_requires=[
-        'torch>=1.12.0',
-        'numpy',
-    ]
-)
+def check_cuda():
+    """Check CUDA availability"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            print(f"CUDA available: {torch.cuda.get_device_name()}")
+            print(f"CUDA version: {torch.version.cuda}")
+            return True
+        else:
+            print("CUDA not available")
+            return False
+    except ImportError:
+        print("PyTorch not installed")
+        return False
+
+def check_triton():
+    """Check Triton availability"""
+    try:
+        import triton
+        print(f"Triton version: {triton.__version__}")
+        return True
+    except ImportError:
+        print("Triton not available")
+        return False
+
+def run_tests():
+    """Run test suite"""
+    print("Running tests...")
+    subprocess.check_call([sys.executable, "-m", "pytest", "test_attention.py", "-v"])
+
+def run_benchmark():
+    """Run benchmark suite"""
+    print("Running benchmark...")
+    subprocess.check_call([sys.executable, "benchmark.py"])
+
+def main():
+    print("Flash Attention Setup")
+    print("=" * 30)
+    
+    # Install requirements
+    install_requirements()
+    
+    # Check dependencies
+    cuda_available = check_cuda()
+    triton_available = check_triton()
+    
+    if not cuda_available:
+        print("Warning: CUDA not available. Only CPU testing will be possible.")
+    
+    if not triton_available:
+        print("Error: Triton not available. Please install triton.")
+        return
+    
+    print("\nSetup complete!")
+    
+    # Ask user what to do
+    while True:
+        print("\nWhat would you like to do?")
+        print("1. Run tests")
+        print("2. Run benchmark")
+        print("3. Exit")
+        
+        choice = input("Enter choice (1-3): ").strip()
+        
+        if choice == "1":
+            try:
+                run_tests()
+            except subprocess.CalledProcessError:
+                print("Tests failed!")
+        elif choice == "2":
+            try:
+                run_benchmark()
+            except subprocess.CalledProcessError:
+                print("Benchmark failed!")
+        elif choice == "3":
+            break
+        else:
+            print("Invalid choice!")
+
+if __name__ == "__main__":
+    main()
