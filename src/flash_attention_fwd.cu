@@ -280,3 +280,20 @@ __global__ void flash_attention_fwd_kernel(
         }
     }
 }
+
+// C wrapper function for kernel launch
+extern "C" void launch_flash_attention_fwd_kernel(
+    const half* Q, const half* K, const half* V, half* O, float* M,
+    float sm_scale, int Z, int H, int N_CTX, int HEAD_DIM, int STAGE, 
+    bool warp_specialize, cudaStream_t stream
+) {
+    const int BLOCK_M = 64;
+    
+    // Grid configuration
+    dim3 grid((N_CTX + BLOCK_M - 1) / BLOCK_M, Z * H);
+    dim3 block(256);  // Sufficient threads for BLOCK_M=64
+    
+    flash_attention_fwd_kernel<<<grid, block, 0, stream>>>(
+        Q, K, V, O, M, sm_scale, Z, H, N_CTX, HEAD_DIM, STAGE, warp_specialize
+    );
+}
