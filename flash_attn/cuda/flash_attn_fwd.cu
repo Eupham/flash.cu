@@ -41,98 +41,71 @@ void flash_attention_backward_cuda(
 /**
  * @brief CUDA kernel for the forward pass of FlashAttention.
  * 
- * Based on the reference FlashAttention implementation pattern.
- * This kernel follows the proper tiling strategy where K/V tiles are in the outer loop
- * and Q processing is in the inner operations.
- * 
- * Template parameters:
- * @param Bc Block size for K/V sequence dimension (Bc = tile size for keys/values)
- * @param Br Block size for Q sequence dimension (Br = tile size for queries, but we process row by row)
- * @param HEAD_DIM Head dimension, used to size shared memory arrays.
+ * Exact implementation following the reference pattern for optimal performance.
+ * This kernel uses raw pointers and simple indexing for maximum efficiency.
  */
 template <int Bc, int Br, int HEAD_DIM>
 __global__ void flash_attention_forward_kernel(
-    const torch::PackedTensorAccessor32<float,4,torch::RestrictPtrTraits> Q_acc,
-    const torch::PackedTensorAccessor32<float,4,torch::RestrictPtrTraits> K_acc,
-    const torch::PackedTensorAccessor32<float,4,torch::RestrictPtrTraits> V_acc,
-    torch::PackedTensorAccessor32<float,4,torch::RestrictPtrTraits> O_acc,
-    torch::PackedTensorAccessor32<float,3,torch::RestrictPtrTraits> L_acc,
-    torch::PackedTensorAccessor32<float,3,torch::RestrictPtrTraits> M_acc,
-    bool is_causal,
-    float softmax_scale
+    const float* Q, const float* K, const float* V, 
+    const int N, const int d,
+    const int Tc, const int Tr, 
+    const float softmax_scale,
+    float* l, float* m, float* O,
+    bool is_causal
 ) {
-    // Block and thread indices
-    const int batch_idx = blockIdx.x;
-    const int head_idx = blockIdx.y;
-    const int tx = threadIdx.x;  // Thread within block (0 to Bc-1)
-    
-    // Tensor dimensions
-    const int N = Q_acc.size(2);  // Sequence length
-    const int d = Q_acc.size(3);  // Head dimension
-    const int actual_head_dim = min(d, HEAD_DIM);
-    
-    // Calculate number of tiles
-    const int Tc = (N + Bc - 1) / Bc;  // Number of K/V tiles
-    const int Tr = (N + Br - 1) / Br;  // Number of Q tiles
-    
-    // Shared memory allocation - same pattern as reference
+    int tx = threadIdx.x;
+    int bx = blockIdx.x; 
+    int by = blockIdx.y;  // batch and head index
+
+    // Offset into Q,K,V,O,l,m - different for each batch and head
+    int qkv_offset = (bx * gridDim.y * N * d) + (by * N * d);  // gridDim.y = nh
+    int lm_offset = (bx * gridDim.y * N) + (by * N);  // offset for l and m
+
+    // Define SRAM for Q,K,V,S
     extern __shared__ float sram[];
-    float* Qi = sram;                           // Size: Bc * d
-    float* Kj = sram + Bc * HEAD_DIM;           // Size: Bc * d  
-    float* Vj = sram + 2 * Bc * HEAD_DIM;      // Size: Bc * d
-    float* S = sram + 3 * Bc * HEAD_DIM;       // Size: Bc * Bc (attention scores)
-    
-    // Only process if thread is within the valid range
-    if (tx >= Bc) return;
-    
-    // Outer loop over K/V tiles (j index)
+    int tile_size = Bc * d;  // size of Qi, Kj, Vj
+    float* Qi = sram;
+    float* Kj = &sram[tile_size];
+    float* Vj = &sram[tile_size * 2];
+    float* S = &sram[tile_size * 3];
+
     for (int j = 0; j < Tc; j++) {
-        
+
         // Load Kj, Vj to SRAM
-        for (int x = 0; x < actual_head_dim; x++) {
+        for (int x = 0; x < d; x++) {
             int kv_idx = j * Bc + tx;
             if (kv_idx < N) {
-                Kj[tx * HEAD_DIM + x] = K_acc[batch_idx][head_idx][kv_idx][x];
-                Vj[tx * HEAD_DIM + x] = V_acc[batch_idx][head_idx][kv_idx][x];
+                Kj[(tx * d) + x] = K[qkv_offset + (kv_idx * d) + x];
+                Vj[(tx * d) + x] = V[qkv_offset + (kv_idx * d) + x];
             } else {
-                Kj[tx * HEAD_DIM + x] = 0.0f;
-                Vj[tx * HEAD_DIM + x] = 0.0f;
+                Kj[(tx * d) + x] = 0.0f;
+                Vj[(tx * d) + x] = 0.0f;
             }
         }
-        // Pad remaining dimensions
-        for (int x = actual_head_dim; x < HEAD_DIM; x++) {
-            Kj[tx * HEAD_DIM + x] = 0.0f;
-            Vj[tx * HEAD_DIM + x] = 0.0f;
-        }
-        __syncthreads();
-        
-        // Inner loop over Q tiles (i index)
-        for (int i = 0; i < Tr; i++) {
-            
-            // Load Qi to SRAM, load previous m and l values
-            for (int x = 0; x < actual_head_dim; x++) {
+        __syncthreads();  // such that the inner loop can use the correct Kj, Vj
+
+        for (int i = 0; i < Tr; i++)  {
+
+            // Load Qi to SRAM, l and m to registers
+            for (int x = 0; x < d; x++) {
                 int q_idx = i * Br + tx;
                 if (q_idx < N) {
-                    Qi[tx * HEAD_DIM + x] = Q_acc[batch_idx][head_idx][q_idx][x];
+                    Qi[(tx * d) + x] = Q[qkv_offset + (q_idx * d) + x];
                 } else {
-                    Qi[tx * HEAD_DIM + x] = 0.0f;
+                    Qi[(tx * d) + x] = 0.0f;
                 }
-            }
-            // Pad remaining dimensions
-            for (int x = actual_head_dim; x < HEAD_DIM; x++) {
-                Qi[tx * HEAD_DIM + x] = 0.0f;
             }
             
             int q_idx = i * Br + tx;
-            float row_m_prev = (q_idx < N) ? M_acc[batch_idx][head_idx][q_idx] : -INFINITY;
-            float row_l_prev = (q_idx < N) ? L_acc[batch_idx][head_idx][q_idx] : 0.0f;
-            
-            // Compute S = QK^T, find row max
+            float row_m_prev = (q_idx < N) ? m[lm_offset + q_idx] : -INFINITY;
+            float row_l_prev = (q_idx < N) ? l[lm_offset + q_idx] : 0.0f;
+
+            // S = QK^T, row_m = rowmax(S)
             float row_m = -INFINITY;
             for (int y = 0; y < Bc; y++) {
-                float sum = 0.0f;
-                for (int x = 0; x < actual_head_dim; x++) {
-                    sum += Qi[tx * HEAD_DIM + x] * Kj[y * HEAD_DIM + x];
+                float sum = 0;
+                for (int x = 0; x < d; x++) {
+                    sum += Qi[(tx * d) + x] * Kj[(y * d) + x];
                 }
                 sum *= softmax_scale;
                 
@@ -144,40 +117,40 @@ __global__ void flash_attention_forward_kernel(
                     }
                 }
                 
-                S[tx * Bc + y] = sum;
-                row_m = fmaxf(row_m, sum);
+                S[(Bc * tx) + y] = sum;
+
+                if (sum > row_m)
+                    row_m = sum;
             }
-            
-            // Compute P = exp(S - row_m), find row sum
-            float row_l = 0.0f;
+
+            // P = exp(S - row_m), row_l = rowsum(P)
+            float row_l = 0;
             for (int y = 0; y < Bc; y++) {
-                S[tx * Bc + y] = expf(S[tx * Bc + y] - row_m);
-                row_l += S[tx * Bc + y];
+                S[(Bc * tx) + y] = __expf(S[(Bc * tx) + y] - row_m);
+                row_l += S[(Bc * tx) + y];
             }
-            
-            // Update m and l using online softmax
+
+            // Compute new m and l
             float row_m_new = fmaxf(row_m_prev, row_m);
-            float row_l_new = expf(row_m_prev - row_m_new) * row_l_prev + expf(row_m - row_m_new) * row_l;
-            
-            // Update output O
+            float row_l_new = (__expf(row_m_prev - row_m_new) * row_l_prev) + (__expf(row_m - row_m_new) * row_l);
+
+            // Write O, l, m to HBM
             if (q_idx < N) {
-                for (int x = 0; x < actual_head_dim; x++) {
-                    float pv = 0.0f;  // P * V
+                for (int x = 0; x < d; x++) {
+                    float pv = 0;  // Pij * Vj
                     for (int y = 0; y < Bc; y++) {
-                        pv += S[tx * Bc + y] * Vj[y * HEAD_DIM + x];
+                        pv += S[(Bc * tx) + y] * Vj[(y * d) + x];
                     }
-                    
-                    float prev_o = O_acc[batch_idx][head_idx][q_idx][x];
-                    O_acc[batch_idx][head_idx][q_idx][x] = (1.0f / row_l_new) * 
-                        (row_l_prev * expf(row_m_prev - row_m_new) * prev_o + expf(row_m - row_m_new) * pv);
+                    float prev_o = O[qkv_offset + (q_idx * d) + x];
+                    O[qkv_offset + (q_idx * d) + x] = (1.0f / row_l_new) * 
+                        ((row_l_prev * __expf(row_m_prev - row_m_new) * prev_o) + 
+                         (__expf(row_m - row_m_new) * pv));
                 }
-                
-                // Update m and l in HBM
-                M_acc[batch_idx][head_idx][q_idx] = row_m_new;
-                L_acc[batch_idx][head_idx][q_idx] = row_l_new;
+                m[lm_offset + q_idx] = row_m_new;
+                l[lm_offset + q_idx] = row_l_new;
             }
         }
-        __syncthreads();
+        __syncthreads();  // otherwise, thread can use the wrong Kj, Vj in inner loop
     }
 }
 
@@ -250,31 +223,35 @@ void flash_attention_forward_cuda(
     const int Bc = T_c_DEFAULT_VAL;  // Use Bc for block size like reference
     const int Br = T_r_DEFAULT_VAL;  // Use Br for block size like reference
     
+    // Calculate Tc and Tr like in the reference
+    const int Tc = (seq_len_q + Bc - 1) / Bc;
+    const int Tr = (seq_len_q + Br - 1) / Br;
+    
     dim3 grid_dim(batch_size, num_heads);   // batch_size x num_heads
     dim3 block_dim(Bc);                     // Bc threads per block
 
     // Calculate shared memory size needed
     const int sram_size = (3 * Bc * head_dim * sizeof(float)) + (Bc * Br * sizeof(float));
     
-    // Get packed tensor accessors for efficient element access in CUDA.
-    auto Q_acc = Q.packed_accessor32<float,4,torch::RestrictPtrTraits>();
-    auto K_acc = K.packed_accessor32<float,4,torch::RestrictPtrTraits>();
-    auto V_acc = V.packed_accessor32<float,4,torch::RestrictPtrTraits>();
-    auto O_acc = O.packed_accessor32<float,4,torch::RestrictPtrTraits>();
-    auto L_acc = L.packed_accessor32<float,3,torch::RestrictPtrTraits>();
-    auto M_acc = M.packed_accessor32<float,3,torch::RestrictPtrTraits>();
+    // Get raw pointers like the reference
+    const float* Q_ptr = Q.data_ptr<float>();
+    const float* K_ptr = K.data_ptr<float>();
+    const float* V_ptr = V.data_ptr<float>();
+    float* O_ptr = O.data_ptr<float>();
+    float* L_ptr = L.data_ptr<float>();
+    float* M_ptr = M.data_ptr<float>();
     
     // --- Dispatch to Templated Kernel based on Head Dimension ---
     // This allows using shared memory arrays sized at compile time via templates.
     if (head_dim <= 32) {
          flash_attention_forward_kernel<32, 32, 32><<<grid_dim, block_dim, sram_size>>>(
-            Q_acc, K_acc, V_acc, O_acc, L_acc, M_acc, is_causal, sm_scale);
+            Q_ptr, K_ptr, V_ptr, seq_len_q, head_dim, Tc, Tr, sm_scale, L_ptr, M_ptr, O_ptr, is_causal);
     } else if (head_dim <= 64) {
          flash_attention_forward_kernel<32, 32, 64><<<grid_dim, block_dim, sram_size>>>(
-            Q_acc, K_acc, V_acc, O_acc, L_acc, M_acc, is_causal, sm_scale);
+            Q_ptr, K_ptr, V_ptr, seq_len_q, head_dim, Tc, Tr, sm_scale, L_ptr, M_ptr, O_ptr, is_causal);
     } else if (head_dim <= 128) { // Corresponds to HEAD_DIM_MAX
          flash_attention_forward_kernel<32, 32, 128><<<grid_dim, block_dim, sram_size>>>(
-            Q_acc, K_acc, V_acc, O_acc, L_acc, M_acc, is_causal, sm_scale);
+            Q_ptr, K_ptr, V_ptr, seq_len_q, head_dim, Tc, Tr, sm_scale, L_ptr, M_ptr, O_ptr, is_causal);
     } else {
         // This case should be caught by the TORCH_CHECK for head_dim vs HEAD_DIM_MAX.
         AT_ERROR("Unsupported head_dimension: ", head_dim, ". Max supported by this build is ", HEAD_DIM_MAX_VAL);
