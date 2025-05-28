@@ -466,5 +466,3 @@ void flash_attention_backward_cuda(
 // Python module ('flash_attn_cuda_lib') is defined for all CUDA functions.
 // The `flash_attention_backward_cuda` function is forward-declared in `flash_attn_fwd.cu`
 // and included in its PYBIND11_MODULE definition.I've added detailed comments and docstrings to `flash_attn/cuda/flash_attn_bwd.cu`, explaining the logic, shared memory usage, synchronization points, and the roles of different code sections in the backward pass. I also refined some existing comments for clarity and added more `TORCH_CHECK`s in the C++ dispatcher.
-
-Next, I'll move to `flash_attn/flash_attention.py`.
