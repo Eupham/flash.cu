@@ -23,8 +23,6 @@
 #define HEAD_DIM_MAX 128
 #endif
 
-constexpr int T_r_DEFAULT_VAL = T_r_DEFAULT;
-constexpr int T_c_DEFAULT_VAL = T_c_DEFAULT;
 constexpr int HEAD_DIM_MAX_VAL = HEAD_DIM_MAX;
 
 // Forward declaration for the backward pass CUDA dispatcher function.
@@ -156,12 +154,12 @@ __global__ void flash_attention_forward_kernel(
 
             // Online softmax update (following the blog's formulas)
             float m_new = fmaxf(m_i, m_ij);
-            float alpha = __exp2f((m_i - m_new) * 1.44269504f);  // log2(e) ≈ 1.44269504
+            float alpha = exp2f((m_i - m_new) * 1.44269504f);  // log2(e) ≈ 1.44269504
             
             // Compute probabilities and sum for current tile
             float l_ij = 0.0f;
             for (int k_idx = 0; k_idx < BLOCK_N; k_idx++) {
-                float p_val = __exp2f((s_tile[tid * BLOCK_N + k_idx] - m_new) * 1.44269504f);
+                float p_val = exp2f((s_tile[tid * BLOCK_N + k_idx] - m_new) * 1.44269504f);
                 s_tile[tid * BLOCK_N + k_idx] = p_val;
                 l_ij += p_val;
             }
