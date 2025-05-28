@@ -42,6 +42,12 @@ void flash_attention_backward_cuda(
  * Based on Alex Dremov's blog post: each job loads a single Q tile, 
  * iterates over all tiles in K and V, and accumulates the result.
  * This follows the exact algorithm from the blog with proper online softmax.
+ * 
+ * Key principles:
+ * 1. Each thread handles one query row (simple assignment)
+ * 2. Load Q tile once, iterate over all K/V tiles
+ * 3. Online softmax: m(x) = max(m(x1), m(x2)) and l(x) = e^(m(x1) - m(x)) * l(x1) + l(x2)
+ * 4. Accumulator update: acc = acc * alpha + new_contribution
  */
 template <int BLOCK_M, int BLOCK_N, int HEAD_DIM>
 __global__ void flash_attention_forward_kernel(
@@ -62,14 +68,14 @@ __global__ void flash_attention_forward_kernel(
     int lm_offset = batch_head_idx * N;
     int q_offset = q_block_idx * BLOCK_M;
 
-    // Shared memory layout
+    // Shared memory layout - simple and clean
     extern __shared__ float sram[];
     float* q_tile = sram;                                    // [BLOCK_M, HEAD_DIM]
     float* k_tile = sram + BLOCK_M * HEAD_DIM;               // [BLOCK_N, HEAD_DIM] 
     float* v_tile = k_tile + BLOCK_N * HEAD_DIM;             // [BLOCK_N, HEAD_DIM]
     float* s_tile = v_tile + BLOCK_N * HEAD_DIM;             // [BLOCK_M, BLOCK_N]
 
-    // Load Q tile once (this block's responsibility) - vectorized
+    // Load Q tile once (this block's responsibility)
     for (int i = tid; i < BLOCK_M * HEAD_DIM; i += blockDim.x) {
         int row = i / HEAD_DIM;
         int col = i % HEAD_DIM;
@@ -83,25 +89,30 @@ __global__ void flash_attention_forward_kernel(
     }
     __syncthreads();
 
-    // Initialize running statistics per thread (each thread handles one Q row)
+    // Each thread handles one Q row (simple Triton-style assignment)
+    if (tid >= BLOCK_M) return;  // Only first BLOCK_M threads participate
+    
+    int q_idx = q_offset + tid;
+    if (q_idx >= N) return;  // Check bounds
+    
+    // Initialize running statistics for this Q row
     float m_i = -INFINITY;  // running max
     float l_i = 0.0f;       // running softmax denominator  
     float acc[HEAD_DIM];    // accumulator for output
     
     // Initialize accumulator to zero
-    if (tid < BLOCK_M) {
-        #pragma unroll
-        for (int d_idx = 0; d_idx < HEAD_DIM; d_idx++) {
-            acc[d_idx] = 0.0f;
-        }
+    #pragma unroll
+    for (int d_idx = 0; d_idx < HEAD_DIM; d_idx++) {
+        acc[d_idx] = 0.0f;
     }
 
-    // Iterate over all K/V tiles (following Triton approach)
+    // Iterate over all K/V tiles (following Triton approach exactly)
     for (int kv_tile_idx = 0; kv_tile_idx < Tc; kv_tile_idx++) {
         int kv_offset = kv_tile_idx * BLOCK_N;
         
         // Load K and V tiles cooperatively
-        for (int i = tid; i < BLOCK_N * HEAD_DIM; i += blockDim.x) {
+        __syncthreads();  // Ensure previous iteration is done
+        for (int i = tid; i < BLOCK_N * HEAD_DIM; i += BLOCK_M) {
             int row = i / HEAD_DIM;
             int col = i % HEAD_DIM;
             int global_row = kv_offset + row;
@@ -116,154 +127,79 @@ __global__ void flash_attention_forward_kernel(
         }
         __syncthreads();
 
-        // Warp-level processing for better efficiency
-        const int warp_id = tid / 32;
-        const int lane_id = tid % 32;
-        const int warps_per_block = (blockDim.x + 31) / 32;
+        // Compute QK^T for this Q row (thread tid processes q_row tid)
+        float m_ij = -INFINITY;  // max of current K/V tile
         
-        // Each warp processes multiple Q rows cooperatively
-        for (int warp_q_idx = warp_id; warp_q_idx < BLOCK_M; warp_q_idx += warps_per_block) {
-            if (warp_q_idx >= BLOCK_M) continue;
+        // Compute attention scores: S = Q @ K^T
+        for (int k_idx = 0; k_idx < BLOCK_N; k_idx++) {
+            float qk_val = 0.0f;
             
-            int q_idx = q_offset + warp_q_idx;
-            if (q_idx >= N) continue;
-
-            // Warp-cooperative QK^T computation
-            float m_ij = -INFINITY;  // max of current tile
-            
-            // Each lane computes a subset of QK^T values
-            for (int k_start = 0; k_start < BLOCK_N; k_start += 32) {
-                int k_idx = k_start + lane_id;
-                float qk_val = 0.0f;
-                
-                if (k_idx < BLOCK_N) {
-                    // Vectorized dot product: Q[warp_q_idx] @ K[k_idx]
-                    const float* q_row = &q_tile[warp_q_idx * HEAD_DIM];
-                    const float* k_row = &k_tile[k_idx * HEAD_DIM];
-                    
-                    // Unroll for better performance
-                    #pragma unroll 8
-                    for (int d_idx = 0; d_idx < HEAD_DIM; d_idx++) {
-                        qk_val += q_row[d_idx] * k_row[d_idx];
-                    }
-                    
-                    qk_val *= softmax_scale;
-                    
-                    // Apply causal mask
-                    if (is_causal) {
-                        int global_k_idx = kv_offset + k_idx;
-                        if (global_k_idx > q_idx) {
-                            qk_val = -INFINITY;
-                        }
-                    }
-                    
-                    s_tile[warp_q_idx * BLOCK_N + k_idx] = qk_val;
-                }
-                
-                // Warp reduction to find max across this chunk
-                #pragma unroll
-                for (int offset = 16; offset > 0; offset /= 2) {
-                    float other_val = __shfl_down_sync(0xffffffff, qk_val, offset);
-                    qk_val = fmaxf(qk_val, other_val);
-                }
-                
-                // Lane 0 has the max for this chunk
-                if (lane_id == 0) {
-                    m_ij = fmaxf(m_ij, qk_val);
-                }
-            }
-            
-            // Broadcast max across warp
-            m_ij = __shfl_sync(0xffffffff, m_ij, 0);
-
-            // Online softmax update (following the blog's formulas)
-            float m_new = fmaxf(m_i, m_ij);
-            float alpha = exp2f((m_i - m_new) * 1.44269504f);  // log2(e) ≈ 1.44269504
-            
-            // Warp-cooperative softmax computation
-            float l_ij = 0.0f;
-            for (int k_start = 0; k_start < BLOCK_N; k_start += 32) {
-                int k_idx = k_start + lane_id;
-                float p_val = 0.0f;
-                
-                if (k_idx < BLOCK_N) {
-                    p_val = exp2f((s_tile[warp_q_idx * BLOCK_N + k_idx] - m_new) * 1.44269504f);
-                    s_tile[warp_q_idx * BLOCK_N + k_idx] = p_val;
-                }
-                
-                // Warp reduction to sum probabilities
-                #pragma unroll
-                for (int offset = 16; offset > 0; offset /= 2) {
-                    p_val += __shfl_down_sync(0xffffffff, p_val, offset);
-                }
-                
-                // Lane 0 accumulates the sum
-                if (lane_id == 0) {
-                    l_ij += p_val;
-                }
-            }
-            
-            // Broadcast sum across warp
-            l_ij = __shfl_sync(0xffffffff, l_ij, 0);
-            
-            // Update denominator: l(x) = e^(m(x1) - m(x)) * l(x1) + l(x2)
-            float l_new = alpha * l_i + l_ij;
-
-            // Warp-cooperative P @ V computation
+            // Dot product: Q[tid] @ K[k_idx]
             #pragma unroll
             for (int d_idx = 0; d_idx < HEAD_DIM; d_idx++) {
-                // Scale previous accumulator
-                acc[d_idx] *= alpha;
-                
-                // Warp-cooperative matrix-vector multiplication
-                float pv = 0.0f;
-                for (int k_start = 0; k_start < BLOCK_N; k_start += 32) {
-                    int k_idx = k_start + lane_id;
-                    float local_pv = 0.0f;
-                    
-                    if (k_idx < BLOCK_N) {
-                        local_pv = s_tile[warp_q_idx * BLOCK_N + k_idx] * v_tile[k_idx * HEAD_DIM + d_idx];
-                    }
-                    
-                    // Warp reduction to sum P@V products
-                    #pragma unroll
-                    for (int offset = 16; offset > 0; offset /= 2) {
-                        local_pv += __shfl_down_sync(0xffffffff, local_pv, offset);
-                    }
-                    
-                    // Lane 0 accumulates the result
-                    if (lane_id == 0) {
-                        pv += local_pv;
-                    }
-                }
-                
-                // Broadcast result across warp
-                pv = __shfl_sync(0xffffffff, pv, 0);
-                acc[d_idx] += pv;
+                qk_val += q_tile[tid * HEAD_DIM + d_idx] * k_tile[k_idx * HEAD_DIM + d_idx];
             }
-
-            // Update running statistics
-            m_i = m_new;
-            l_i = l_new;
+            
+            qk_val *= softmax_scale;
+            
+            // Apply causal mask
+            if (is_causal) {
+                int global_k_idx = kv_offset + k_idx;
+                if (global_k_idx > q_idx) {
+                    qk_val = -INFINITY;
+                }
+            }
+            
+            s_tile[tid * BLOCK_N + k_idx] = qk_val;
+            m_ij = fmaxf(m_ij, qk_val);  // Track max for this tile
         }
-        __syncthreads();
+
+        // Online softmax update (exact formulas from blog post)
+        // m(x) = max(m(x1), m(x2))
+        float m_new = fmaxf(m_i, m_ij);
+        
+        // alpha = exp(m(x1) - m(x))
+        float alpha = expf(m_i - m_new);
+        
+        // Compute softmax probabilities and sum for current tile
+        float l_ij = 0.0f;
+        for (int k_idx = 0; k_idx < BLOCK_N; k_idx++) {
+            float p_val = expf(s_tile[tid * BLOCK_N + k_idx] - m_new);
+            s_tile[tid * BLOCK_N + k_idx] = p_val;
+            l_ij += p_val;
+        }
+        
+        // Update denominator: l(x) = e^(m(x1) - m(x)) * l(x1) + l(x2)
+        float l_new = alpha * l_i + l_ij;
+
+        // Update accumulator: acc = acc * alpha + P @ V
+        #pragma unroll
+        for (int d_idx = 0; d_idx < HEAD_DIM; d_idx++) {
+            // Scale previous accumulator
+            acc[d_idx] *= alpha;
+            
+            // Add new contribution: P @ V
+            float pv = 0.0f;
+            for (int k_idx = 0; k_idx < BLOCK_N; k_idx++) {
+                pv += s_tile[tid * BLOCK_N + k_idx] * v_tile[k_idx * HEAD_DIM + d_idx];
+            }
+            acc[d_idx] += pv;
+        }
+
+        // Update running statistics
+        m_i = m_new;
+        l_i = l_new;
     }
 
     // Final normalization and write output
-    if (tid < BLOCK_M) {
-        int q_idx = q_offset + tid;
-        if (q_idx < N) {
-            // Normalize by softmax denominator
-            #pragma unroll
-            for (int d_idx = 0; d_idx < HEAD_DIM; d_idx++) {
-                O[qkv_offset + q_idx * d + d_idx] = acc[d_idx] / l_i;
-            }
-            
-            // Store running statistics
-            m[lm_offset + q_idx] = m_i;
-            l[lm_offset + q_idx] = l_i;
-        }
+    #pragma unroll
+    for (int d_idx = 0; d_idx < HEAD_DIM; d_idx++) {
+        O[qkv_offset + q_idx * d + d_idx] = acc[d_idx] / l_i;
     }
+    
+    // Store running statistics
+    m[lm_offset + q_idx] = m_i;
+    l[lm_offset + q_idx] = l_i;
 }
 
 // Additional kernel template instantiations for different tile sizes
@@ -410,9 +346,9 @@ void flash_attention_forward_cuda(
     const int Tr = (seq_len_q + BLOCK_M - 1) / BLOCK_M;   // Number of Q tiles
     
     // Grid configuration: (batch_size, num_heads, num_Q_tiles)
-    // Each block processes one Q tile, iterates through all K/V tiles
+    // Each block processes one Q tile, each thread handles one Q row
     dim3 grid_dim(batch_size, num_heads, Tr);
-    dim3 block_dim(128);  // Use warp-aligned thread count for better efficiency
+    dim3 block_dim(BLOCK_M);  // Each thread handles one query row
     
     // Get raw pointers
     const float* Q_ptr = Q.data_ptr<float>();
