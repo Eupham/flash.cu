@@ -14,10 +14,10 @@
 // Conservative shared memory defaults to avoid CUDA build errors on most GPUs.
 // These can be overwritten at compile time with -DT_r_DEFAULT=... etc.
 #ifndef T_r_DEFAULT
-#define T_r_DEFAULT 64
+#define T_r_DEFAULT 32
 #endif
 #ifndef T_c_DEFAULT
-#define T_c_DEFAULT 64
+#define T_c_DEFAULT 32
 #endif
 #ifndef HEAD_DIM_MAX
 #define HEAD_DIM_MAX 128
