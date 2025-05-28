@@ -116,76 +116,129 @@ __global__ void flash_attention_forward_kernel(
         }
         __syncthreads();
 
-        // Process each Q row that this thread is responsible for
-        if (tid < BLOCK_M) {
-            int q_idx = q_offset + tid;
+        // Warp-level processing for better efficiency
+        const int warp_id = tid / 32;
+        const int lane_id = tid % 32;
+        const int warps_per_block = (blockDim.x + 31) / 32;
+        
+        // Each warp processes multiple Q rows cooperatively
+        for (int warp_q_idx = warp_id; warp_q_idx < BLOCK_M; warp_q_idx += warps_per_block) {
+            if (warp_q_idx >= BLOCK_M) continue;
+            
+            int q_idx = q_offset + warp_q_idx;
             if (q_idx >= N) continue;
 
-            // Compute QK^T for this Q row
-            float m_ij = -INFINITY;  // max for current tile
+            // Warp-cooperative QK^T computation
+            float m_ij = -INFINITY;  // max of current tile
             
-            // Warp-level optimization: process K rows in chunks of 32 for better memory access
-            const int warp_id = tid / 32;
-            const int lane_id = tid % 32;
-            
-            for (int k_idx = 0; k_idx < BLOCK_N; k_idx++) {
-                // Vectorized dot product: Q[tid] @ K[k_idx] with warp cooperation
+            // Each lane computes a subset of QK^T values
+            for (int k_start = 0; k_start < BLOCK_N; k_start += 32) {
+                int k_idx = k_start + lane_id;
                 float qk_val = 0.0f;
                 
-                // Each thread computes dot product for its Q row
-                const float* q_row = &q_tile[tid * HEAD_DIM];
-                const float* k_row = &k_tile[k_idx * HEAD_DIM];
-                
-                // Unroll for better performance and use warp-level cooperation
-                #pragma unroll 8
-                for (int d_idx = 0; d_idx < HEAD_DIM; d_idx++) {
-                    qk_val += q_row[d_idx] * k_row[d_idx];
-                }
-                
-                qk_val *= softmax_scale;
-                
-                // Apply causal mask
-                if (is_causal) {
-                    int global_k_idx = kv_offset + k_idx;
-                    if (global_k_idx > q_idx) {
-                        qk_val = -INFINITY;
+                if (k_idx < BLOCK_N) {
+                    // Vectorized dot product: Q[warp_q_idx] @ K[k_idx]
+                    const float* q_row = &q_tile[warp_q_idx * HEAD_DIM];
+                    const float* k_row = &k_tile[k_idx * HEAD_DIM];
+                    
+                    // Unroll for better performance
+                    #pragma unroll 8
+                    for (int d_idx = 0; d_idx < HEAD_DIM; d_idx++) {
+                        qk_val += q_row[d_idx] * k_row[d_idx];
                     }
+                    
+                    qk_val *= softmax_scale;
+                    
+                    // Apply causal mask
+                    if (is_causal) {
+                        int global_k_idx = kv_offset + k_idx;
+                        if (global_k_idx > q_idx) {
+                            qk_val = -INFINITY;
+                        }
+                    }
+                    
+                    s_tile[warp_q_idx * BLOCK_N + k_idx] = qk_val;
                 }
                 
-                s_tile[tid * BLOCK_N + k_idx] = qk_val;
-                m_ij = fmaxf(m_ij, qk_val);
+                // Warp reduction to find max across this chunk
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset /= 2) {
+                    float other_val = __shfl_down_sync(0xffffffff, qk_val, offset);
+                    qk_val = fmaxf(qk_val, other_val);
+                }
+                
+                // Lane 0 has the max for this chunk
+                if (lane_id == 0) {
+                    m_ij = fmaxf(m_ij, qk_val);
+                }
             }
+            
+            // Broadcast max across warp
+            m_ij = __shfl_sync(0xffffffff, m_ij, 0);
 
             // Online softmax update (following the blog's formulas)
             float m_new = fmaxf(m_i, m_ij);
             float alpha = exp2f((m_i - m_new) * 1.44269504f);  // log2(e) ≈ 1.44269504
             
-            // Compute softmax probabilities and denominator for this tile
+            // Warp-cooperative softmax computation
             float l_ij = 0.0f;
-            for (int k_idx = 0; k_idx < BLOCK_N; k_idx++) {
-                float p_val = exp2f((s_tile[tid * BLOCK_N + k_idx] - m_new) * 1.44269504f);
-                s_tile[tid * BLOCK_N + k_idx] = p_val;
-                l_ij += p_val;
+            for (int k_start = 0; k_start < BLOCK_N; k_start += 32) {
+                int k_idx = k_start + lane_id;
+                float p_val = 0.0f;
+                
+                if (k_idx < BLOCK_N) {
+                    p_val = exp2f((s_tile[warp_q_idx * BLOCK_N + k_idx] - m_new) * 1.44269504f);
+                    s_tile[warp_q_idx * BLOCK_N + k_idx] = p_val;
+                }
+                
+                // Warp reduction to sum probabilities
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset /= 2) {
+                    p_val += __shfl_down_sync(0xffffffff, p_val, offset);
+                }
+                
+                // Lane 0 accumulates the sum
+                if (lane_id == 0) {
+                    l_ij += p_val;
+                }
             }
+            
+            // Broadcast sum across warp
+            l_ij = __shfl_sync(0xffffffff, l_ij, 0);
             
             // Update denominator: l(x) = e^(m(x1) - m(x)) * l(x1) + l(x2)
             float l_new = alpha * l_i + l_ij;
 
-            // Compute P @ V with warp-level optimization for memory access
+            // Warp-cooperative P @ V computation
             #pragma unroll
             for (int d_idx = 0; d_idx < HEAD_DIM; d_idx++) {
                 // Scale previous accumulator
                 acc[d_idx] *= alpha;
                 
-                // Matrix-vector multiplication with optimized memory access
+                // Warp-cooperative matrix-vector multiplication
                 float pv = 0.0f;
-                
-                // Vectorized computation with memory coalescing
-                #pragma unroll 4
-                for (int k_idx = 0; k_idx < BLOCK_N; k_idx++) {
-                    pv += s_tile[tid * BLOCK_N + k_idx] * v_tile[k_idx * HEAD_DIM + d_idx];
+                for (int k_start = 0; k_start < BLOCK_N; k_start += 32) {
+                    int k_idx = k_start + lane_id;
+                    float local_pv = 0.0f;
+                    
+                    if (k_idx < BLOCK_N) {
+                        local_pv = s_tile[warp_q_idx * BLOCK_N + k_idx] * v_tile[k_idx * HEAD_DIM + d_idx];
+                    }
+                    
+                    // Warp reduction to sum P@V products
+                    #pragma unroll
+                    for (int offset = 16; offset > 0; offset /= 2) {
+                        local_pv += __shfl_down_sync(0xffffffff, local_pv, offset);
+                    }
+                    
+                    // Lane 0 accumulates the result
+                    if (lane_id == 0) {
+                        pv += local_pv;
+                    }
                 }
                 
+                // Broadcast result across warp
+                pv = __shfl_sync(0xffffffff, pv, 0);
                 acc[d_idx] += pv;
             }
 
