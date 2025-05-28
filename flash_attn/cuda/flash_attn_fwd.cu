@@ -143,23 +143,29 @@ __global__ void flash_attention_forward_kernel(
         __syncthreads(); // Ensure K_tile and V_tile are fully loaded before use.
 
         // --- Compute Scores S_ij = (Q_i @ K_j_tile.T) * sm_scale ---
-        // Each thread computes scores for its assigned query row
+        // Optimized matrix multiplication with better memory access patterns
         if (valid_q) {
-            for (int k_tile_col_idx = threadIdx.x; k_tile_col_idx < T_c; k_tile_col_idx += blockDim.x) {
-                float sum_qk = 0.0f; // Dot product accumulator.
+            // Compute all scores for this thread's query row in parallel
+            for (int k_col = threadIdx.x; k_col < T_c; k_col += blockDim.x) {
+                float dot_product = 0.0f;
+                
+                // Vectorized dot product computation
+                #pragma unroll 4
                 for (int d = 0; d < actual_head_dim; ++d) {
-                    sum_qk += q_tile[local_q_idx][d] * k_tile[k_tile_col_idx][d];
+                    dot_product += q_tile[local_q_idx][d] * k_tile[k_col][d];
                 }
-                float current_s_val = sum_qk * sm_scale; // Apply scaling factor.
-
-                // Apply causal masking if enabled.
+                
+                float score = dot_product * sm_scale;
+                
+                // Apply causal masking if enabled
                 if (is_causal) {
-                    int k_abs_idx = kv_block_col_start + k_tile_col_idx; // Absolute key index.
-                    if (k_abs_idx > q_abs_idx) { // If key is "after" query.
-                        current_s_val = -std::numeric_limits<float>::infinity();
+                    int k_abs_idx = kv_block_col_start + k_col;
+                    if (k_abs_idx > q_abs_idx) {
+                        score = -std::numeric_limits<float>::infinity();
                     }
                 }
-                s_tile[local_q_idx][k_tile_col_idx] = current_s_val;
+                
+                s_tile[local_q_idx][k_col] = score;
             }
         }
         __syncthreads(); // Ensure all S_ij scores are computed.
@@ -293,15 +299,12 @@ void flash_attention_forward_cuda(
     TORCH_CHECK(head_dim <= HEAD_DIM_MAX_VAL, "Head dimension exceeds compiled maximum HEAD_DIM_MAX.");
     
     // --- Kernel Launch Configuration ---
-    // Define thread block dimensions. These can be tuned.
-    // blockDim.x: Threads along one dimension (e.g., head_dim elements or K_tile columns).
-    // blockDim.y: Threads along another dimension (e.g., Q_tile rows or K_tile rows).
+    // Optimized thread block configuration for better performance
+    // Use power-of-2 dimensions for better warp utilization
     dim3 threads_per_block;
-    if (head_dim <= 32) threads_per_block = dim3(32, 4, 1); // Example: 128 threads
-    else if (head_dim <= 64) threads_per_block = dim3(64, 4, 1); // Example: 256 threads
-    else threads_per_block = dim3(128, 2, 1); // Example: 256 threads
-    // Total threads per block = threads_per_block.x * threads_per_block.y * threads_per_block.z
-    // This configuration should be chosen carefully based on kernel's parallelization strategy.
+    if (head_dim <= 32) threads_per_block = dim3(16, 8, 1); // 128 threads: 16x8 for better memory coalescing
+    else if (head_dim <= 64) threads_per_block = dim3(32, 8, 1); // 256 threads: 32x8 for head_dim=64
+    else threads_per_block = dim3(32, 8, 1); // 256 threads: maintain same config for larger dims
 
     // Define grid dimensions. Each block processes T_r_DEFAULT rows of Q.
     dim3 num_blocks((seq_len_q + T_r_DEFAULT_VAL - 1) / T_r_DEFAULT_VAL, num_heads, batch_size);
