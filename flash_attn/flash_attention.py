@@ -56,6 +56,9 @@ class _FlashAttentionFunction(torch.autograd.Function):
         # Initialize logsumexp tensor 'L' for backward pass stability and correctness
         # Shape: (batch_size, num_heads, q_seq_len)
         L = torch.empty((batch_size, num_heads, q_seq_len), device=q.device, dtype=torch.float32)
+        # Initialize row max tensor 'M' for online softmax
+        # Shape: (batch_size, num_heads, q_seq_len)
+        M = torch.full((batch_size, num_heads, q_seq_len), float('-inf'), device=q.device, dtype=torch.float32)
 
         if flash_attn_cuda_lib is None:
             raise RuntimeError("FlashAttention CUDA extension not loaded. Cannot proceed with forward pass.")
@@ -63,7 +66,7 @@ class _FlashAttentionFunction(torch.autograd.Function):
         # Call the forward pass CUDA kernel
         flash_attn_cuda_lib.forward(
             q, k, v,    # Input tensors
-            o, L,       # Output tensors
+            o, L, M,    # Output tensors
             is_causal, sm_scale # Parameters
         )
 
