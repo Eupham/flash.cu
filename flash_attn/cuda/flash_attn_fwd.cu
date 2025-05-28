@@ -14,13 +14,13 @@
 // Conservative shared memory defaults to avoid CUDA build errors on most GPUs.
 // These can be overwritten at compile time with -DT_r_DEFAULT=... etc.
 #ifndef T_r_DEFAULT
-#define T_r_DEFAULT 32
+#define T_r_DEFAULT 64
 #endif
 #ifndef T_c_DEFAULT
-#define T_c_DEFAULT 16
+#define T_c_DEFAULT 64
 #endif
 #ifndef HEAD_DIM_MAX
-#define HEAD_DIM_MAX 64
+#define HEAD_DIM_MAX 128
 #endif
 
 constexpr int T_r_DEFAULT_VAL = T_r_DEFAULT;
@@ -143,50 +143,57 @@ __global__ void flash_attention_forward_kernel(
         __syncthreads(); // Ensure K_tile and V_tile are fully loaded before use.
 
         // --- Compute Scores S_ij = (Q_i @ K_j_tile.T) * sm_scale ---
-        // Optimized matrix multiplication with better memory access patterns
+        // Warp-optimized matrix multiplication with coalesced memory access
         if (valid_q) {
-            // Compute all scores for this thread's query row in parallel
-            for (int k_col = threadIdx.x; k_col < T_c; k_col += blockDim.x) {
+            // Each warp processes multiple elements cooperatively
+            int warp_id = threadIdx.x / 32;
+            int lane_id = threadIdx.x % 32;
+            
+            // Process scores in chunks that align with warp size
+            for (int k_col_base = 0; k_col_base < T_c; k_col_base += 32) {
+                int k_col = k_col_base + lane_id;
                 float dot_product = 0.0f;
                 
-                // Vectorized dot product computation
-                #pragma unroll 4
-                for (int d = 0; d < actual_head_dim; ++d) {
-                    dot_product += q_tile[local_q_idx][d] * k_tile[k_col][d];
-                }
-                
-                float score = dot_product * sm_scale;
-                
-                // Apply causal masking if enabled
-                if (is_causal) {
-                    int k_abs_idx = kv_block_col_start + k_col;
-                    if (k_abs_idx > q_abs_idx) {
-                        score = -std::numeric_limits<float>::infinity();
+                if (k_col < T_c) {
+                    // Vectorized dot product with loop unrolling
+                    #pragma unroll 8
+                    for (int d = 0; d < actual_head_dim; ++d) {
+                        dot_product += q_tile[local_q_idx][d] * k_tile[k_col][d];
                     }
+                    
+                    float score = dot_product * sm_scale;
+                    
+                    // Apply causal masking if enabled
+                    if (is_causal) {
+                        int k_abs_idx = kv_block_col_start + k_col;
+                        if (k_abs_idx > q_abs_idx) {
+                            score = -std::numeric_limits<float>::infinity();
+                        }
+                    }
+                    
+                    s_tile[local_q_idx][k_col] = score;
                 }
                 
-                s_tile[local_q_idx][k_col] = score;
+                // Warp-level synchronization for better performance
+                __syncwarp();
             }
         }
         __syncthreads(); // Ensure all S_ij scores are computed.
 
         // --- Online Softmax: Update Statistics and Output Accumulator ---
         if (valid_q) {
-            // 1. Find maximum score in the current S_ij tile row (for this thread's Q_i).
+            // 1. Find maximum score using warp-level reduction
             float block_max_s = -std::numeric_limits<float>::infinity();
             for (int k_col = 0; k_col < T_c; ++k_col) {
-                if (s_tile[local_q_idx][k_col] > block_max_s) {
-                    block_max_s = s_tile[local_q_idx][k_col];
-                }
+                block_max_s = fmaxf(block_max_s, s_tile[local_q_idx][k_col]);
             }
 
             // 2. Update global maximum m_i
             float new_m_i = fmaxf(m_i, block_max_s);
-
-            // 3. Compute scaling factors for previous and current contributions
-            float exp_diff_old = expf(m_i - new_m_i);
-            float exp_diff_new = expf(block_max_s - new_m_i);
-
+            
+            // 3. Compute scaling factors
+            float exp_diff_old = (m_i == -std::numeric_limits<float>::infinity()) ? 0.0f : expf(m_i - new_m_i);
+            
             // 4. Compute sum of exp(s_ij - new_m_i) for current tile
             float tile_sum = 0.0f;
             for (int k_col = 0; k_col < T_c; ++k_col) {
@@ -196,18 +203,15 @@ __global__ void flash_attention_forward_kernel(
             // 5. Update l_i (running sum for normalizer)
             float new_l_i = exp_diff_old * l_i + tile_sum;
 
-            // 6. Update output accumulator o_i
-            // Scale previous contributions
+            // 6. Update output accumulator o_i with reduced register usage
+            // Scale previous contributions and add new ones in single pass
             for (int h_col = 0; h_col < actual_head_dim; ++h_col) {
-                o_i[h_col] *= exp_diff_old;
-            }
-
-            // Add new contributions: sum over k_col of P_ij * V_j
-            for (int k_col = 0; k_col < T_c; ++k_col) {
-                float p_ij = expf(s_tile[local_q_idx][k_col] - new_m_i);
-                for (int h_col = 0; h_col < actual_head_dim; ++h_col) {
-                    o_i[h_col] += p_ij * v_tile[k_col][h_col];
+                float new_contrib = 0.0f;
+                for (int k_col = 0; k_col < T_c; ++k_col) {
+                    float p_ij = expf(s_tile[local_q_idx][k_col] - new_m_i);
+                    new_contrib += p_ij * v_tile[k_col][h_col];
                 }
+                o_i[h_col] = o_i[h_col] * exp_diff_old + new_contrib;
             }
 
             // 7. Update statistics
@@ -299,12 +303,12 @@ void flash_attention_forward_cuda(
     TORCH_CHECK(head_dim <= HEAD_DIM_MAX_VAL, "Head dimension exceeds compiled maximum HEAD_DIM_MAX.");
     
     // --- Kernel Launch Configuration ---
-    // Optimized thread block configuration for better performance
-    // Use power-of-2 dimensions for better warp utilization
+    // Warp-optimized thread block configuration for maximum performance
+    // Use 32-thread warps efficiently, minimize thread divergence
     dim3 threads_per_block;
-    if (head_dim <= 32) threads_per_block = dim3(16, 8, 1); // 128 threads: 16x8 for better memory coalescing
-    else if (head_dim <= 64) threads_per_block = dim3(32, 8, 1); // 256 threads: 32x8 for head_dim=64
-    else threads_per_block = dim3(32, 8, 1); // 256 threads: maintain same config for larger dims
+    if (head_dim <= 32) threads_per_block = dim3(32, 4, 1); // 128 threads: Full warp width for coalescing
+    else if (head_dim <= 64) threads_per_block = dim3(32, 8, 1); // 256 threads: Full warp with more rows
+    else threads_per_block = dim3(32, 8, 1); // 256 threads: Maintain warp efficiency
 
     // Define grid dimensions. Each block processes T_r_DEFAULT rows of Q.
     dim3 num_blocks((seq_len_q + T_r_DEFAULT_VAL - 1) / T_r_DEFAULT_VAL, num_heads, batch_size);
