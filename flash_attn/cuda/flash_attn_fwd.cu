@@ -308,7 +308,7 @@ void flash_attention_forward_cuda(
     TORCH_CHECK(Q.dtype() == K.dtype() && Q.dtype() == V.dtype(), "All input tensors Q, K, V must have the same dtype");
     TORCH_CHECK(Q.dtype() == O.dtype(), "Input Q and Output O tensors must have the same dtype");
     TORCH_CHECK(Q.dtype() == torch::kFloat32, "Currently only Float32 is supported for Q, K, V, O"); 
-    TORCH_CHECK(L.dtype() == torch.kFloat32, "L tensor must be Float32");
+    TORCH_CHECK(L.dtype() == torch::kFloat32, "L tensor must be Float32");
 
 
     // --- Shape Compatibility and Parameter Extraction ---
