@@ -1,4 +1,4 @@
-#pragma once
+f3#pragma once
 
 #include <torch/extension.h>
 #include <cuda_runtime.h>
@@ -25,8 +25,8 @@ std::vector<torch::Tensor> flash_attention_backward(
     bool causal
 );
 
-// CUDA kernel declarations
-void flash_attention_fwd_kernel(
+// CUDA kernel launcher functions
+void launch_flash_attention_fwd_kernel(
     const __half* Q,
     const __half* K,
     const __half* V, 
@@ -35,7 +35,8 @@ void flash_attention_fwd_kernel(
     float sm_scale,
     int Z, int H, int N_CTX, int HEAD_DIM,
     int STAGE,
-    bool warp_specialize
+    bool warp_specialize,
+    cudaStream_t stream
 );
 
 // TODO: Complete backward kernel implementation
@@ -66,3 +67,16 @@ constexpr int BLOCK_N = 64;
 constexpr int BLOCK_K = 64;
 constexpr int WARP_SIZE = 32;
 constexpr int MAX_THREADS_PER_BLOCK = 1024;
+
+// Shared memory structure for backward pass
+template<int BLOCK_M, int BLOCK_N, int HEAD_DIM>
+struct BackwardSharedMemory {
+    __half q_smem[BLOCK_M][HEAD_DIM];
+    __half k_smem[BLOCK_N][HEAD_DIM];
+    __half v_smem[BLOCK_N][HEAD_DIM];
+    __half do_smem[BLOCK_M][HEAD_DIM];
+    __half o_smem[BLOCK_M][HEAD_DIM];
+    float qk_smem[BLOCK_M][BLOCK_N];
+    float softmax_smem[BLOCK_M][BLOCK_N];
+    float delta_smem[BLOCK_M];
+};

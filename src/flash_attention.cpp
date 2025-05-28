@@ -43,7 +43,7 @@ torch::Tensor flash_attention_forward(
     __half* out_ptr = reinterpret_cast<__half*>(out.data_ptr<at::Half>());
     float* lse_ptr = softmax_lse.data_ptr<float>();
     
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     
     // Determine STAGE based on causal flag
     int STAGE = causal ? 3 : 1;  // 3 = both stages for causal, 1 = non-causal
@@ -96,7 +96,7 @@ std::vector<torch::Tensor> flash_attention_backward(
     __half* grad_k_ptr = reinterpret_cast<__half*>(grad_k.data_ptr<at::Half>());
     __half* grad_v_ptr = reinterpret_cast<__half*>(grad_v.data_ptr<at::Half>());
     
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     
     // TODO: Complete backward kernel implementation
     // flash_attention_bwd_kernel(
