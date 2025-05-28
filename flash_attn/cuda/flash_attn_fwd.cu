@@ -70,172 +70,147 @@ __global__ void flash_attention_forward_kernel(
     bool is_causal,
     float sm_scale
 ) {
-    // --- Block and Dimension Setup ---
-    // Determine batch, head, and starting query row for this thread block.
+    // Block and thread indices
     const int batch_idx = blockIdx.z;
     const int head_idx = blockIdx.y;
-    const int q_block_start_row = blockIdx.x * T_r; // Each block processes T_r rows of Q.
-
-    // Get actual dimensions from input tensors.
-    const int actual_head_dim = Q_acc.size(3); 
+    const int q_block_start = blockIdx.x * T_r;
+    
+    const int thread_id = threadIdx.x;
+    const int warp_id = thread_id / 32;
+    const int lane_id = thread_id % 32;
+    
+    // Tensor dimensions
+    const int actual_head_dim = Q_acc.size(3);
     const int seq_len_q = Q_acc.size(2);
     const int seq_len_kv = K_acc.size(2);
-
-    // Ensure the kernel isn't run with a head dimension larger than it was compiled for.
-    if (actual_head_dim > HEAD_DIM) {
-        // This situation should ideally be prevented by the C++ dispatcher.
-        return; 
-    }
-
-    // --- Shared Memory Allocation ---
-    // Shared memory tiles for Q, K, V, and intermediate scores S_ij.
-    // Sized using compile-time template parameters for efficiency.
-    __shared__ float q_tile[T_r][HEAD_DIM]; // Stores one Q-vector per row if T_r > 1, or part of it.
-    __shared__ float k_tile[T_c][HEAD_DIM]; // Stores a tile of K vectors.
-    __shared__ float v_tile[T_c][HEAD_DIM]; // Stores a tile of V vectors.
-    __shared__ float s_tile[T_r][T_c];      // Stores QK^T scores for the current q_tile and k_tile.
-
-    // --- Initialize Output Accumulators and Online Softmax Statistics ---
-    // Each thread handles one query row, storing state in registers
-    const int local_q_idx = threadIdx.y; // Thread's query row within the block
-    const int q_abs_idx = q_block_start_row + local_q_idx; // Absolute query index
     
-    // Per-thread online softmax statistics and output accumulator
-    float m_i = -std::numeric_limits<float>::infinity();
+    if (actual_head_dim > HEAD_DIM) return;
+    
+    // Shared memory tiles - optimized layout
+    __shared__ float q_tile[T_r][HEAD_DIM];
+    __shared__ float k_tile[T_c][HEAD_DIM]; 
+    __shared__ float v_tile[T_c][HEAD_DIM];
+    __shared__ float s_tile[T_r][T_c];
+    
+    // Per-thread query row assignment
+    const int threads_per_row = blockDim.x / T_r;
+    const int local_q_idx = thread_id / threads_per_row;
+    const int q_abs_idx = q_block_start + local_q_idx;
+    const int col_offset = thread_id % threads_per_row;
+    
+    // Initialize per-thread accumulation
+    float m_i = -INFINITY;
     float l_i = 0.0f;
-    float o_i[HEAD_DIM] = {0}; // Initialize to zero
+    float o_acc[HEAD_DIM];
+    #pragma unroll
+    for (int d = 0; d < HEAD_DIM; ++d) {
+        o_acc[d] = 0.0f;
+    }
     
-    // Early exit for threads beyond valid query range
     bool valid_q = (q_abs_idx < seq_len_q);
     
-    // --- Load Q-block into Shared Memory (All threads cooperate) ---
-    // Load T_r query vectors into shared memory in parallel
-    for (int q_row = threadIdx.y; q_row < T_r; q_row += blockDim.y) {
-        int q_abs_row = q_block_start_row + q_row;
-        for (int h_col = threadIdx.x; h_col < actual_head_dim; h_col += blockDim.x) {
-            if (q_abs_row < seq_len_q) {
-                q_tile[q_row][h_col] = Q_acc[batch_idx][head_idx][q_abs_row][h_col];
-            } else {
-                q_tile[q_row][h_col] = 0.0f;
-            }
+    // Load Q tile with coalesced access
+    if (valid_q) {
+        for (int d = col_offset; d < actual_head_dim; d += threads_per_row) {
+            q_tile[local_q_idx][d] = Q_acc[batch_idx][head_idx][q_abs_idx][d];
+        }
+        for (int d = actual_head_dim + col_offset; d < HEAD_DIM; d += threads_per_row) {
+            q_tile[local_q_idx][d] = 0.0f;
         }
     }
-    __syncthreads(); // Ensure all Q vectors are loaded
-
-    // --- Outer Loop: Iterate over Key/Value Blocks (Tiles of K and V) ---
-    // Process K and V in tiles of size T_c to manage memory movement.
-    for (int kv_block_col_start = 0; kv_block_col_start < seq_len_kv; kv_block_col_start += T_c) {
+    __syncthreads();
+    
+    // Process K/V tiles
+    for (int kv_start = 0; kv_start < seq_len_kv; kv_start += T_c) {
         
-        // --- Load K_j_tile and V_j_tile into Shared Memory ---
-        // All threads cooperate to load T_c vectors of K and V into k_tile and v_tile.
-        for (int tc_row = threadIdx.y; tc_row < T_c; tc_row += blockDim.y) { 
-            for (int h_col = threadIdx.x; h_col < actual_head_dim; h_col += blockDim.x) { 
-                int k_abs_row_idx = kv_block_col_start + tc_row; // Absolute index in K/V sequence.
-                if (k_abs_row_idx < seq_len_kv) { // Boundary check for K/V sequence length.
-                    k_tile[tc_row][h_col] = K_acc[batch_idx][head_idx][k_abs_row_idx][h_col];
-                    v_tile[tc_row][h_col] = V_acc[batch_idx][head_idx][k_abs_row_idx][h_col];
-                } else { // Pad with zeros if past actual K/V sequence length.
-                    k_tile[tc_row][h_col] = 0.0f;
-                    v_tile[tc_row][h_col] = 0.0f;
+        // Load K/V tiles with coalesced access
+        for (int tc_row = thread_id / HEAD_DIM; tc_row < T_c; tc_row += blockDim.x / HEAD_DIM) {
+            int k_abs_idx = kv_start + tc_row;
+            for (int d = thread_id % HEAD_DIM; d < actual_head_dim; d += HEAD_DIM) {
+                if (k_abs_idx < seq_len_kv) {
+                    k_tile[tc_row][d] = K_acc[batch_idx][head_idx][k_abs_idx][d];
+                    v_tile[tc_row][d] = V_acc[batch_idx][head_idx][k_abs_idx][d];
+                } else {
+                    k_tile[tc_row][d] = 0.0f;
+                    v_tile[tc_row][d] = 0.0f;
                 }
             }
         }
-        __syncthreads(); // Ensure K_tile and V_tile are fully loaded before use.
-
-        // --- Compute Scores S_ij = (Q_i @ K_j_tile.T) * sm_scale ---
-        // Warp-optimized matrix multiplication with coalesced memory access
+        __syncthreads();
+        
+        // Compute QK^T scores with warp-level optimization
         if (valid_q) {
-            // Each warp processes multiple elements cooperatively
-            int warp_id = threadIdx.x / 32;
-            int lane_id = threadIdx.x % 32;
-            
-            // Process scores in chunks that align with warp size
-            for (int k_col_base = 0; k_col_base < T_c; k_col_base += 32) {
-                int k_col = k_col_base + lane_id;
-                float dot_product = 0.0f;
+            for (int k_col = col_offset; k_col < T_c; k_col += threads_per_row) {
+                float score = 0.0f;
                 
-                if (k_col < T_c) {
-                    // Vectorized dot product with loop unrolling
-                    #pragma unroll 8
-                    for (int d = 0; d < actual_head_dim; ++d) {
-                        dot_product += q_tile[local_q_idx][d] * k_tile[k_col][d];
-                    }
-                    
-                    float score = dot_product * sm_scale;
-                    
-                    // Apply causal masking if enabled
-                    if (is_causal) {
-                        int k_abs_idx = kv_block_col_start + k_col;
-                        if (k_abs_idx > q_abs_idx) {
-                            score = -std::numeric_limits<float>::infinity();
-                        }
-                    }
-                    
-                    s_tile[local_q_idx][k_col] = score;
+                // Vectorized dot product
+                #pragma unroll 4
+                for (int d = 0; d < actual_head_dim; ++d) {
+                    score += q_tile[local_q_idx][d] * k_tile[k_col][d];
                 }
                 
-                // Warp-level synchronization for better performance
-                __syncwarp();
+                score *= sm_scale;
+                
+                // Apply causal mask
+                if (is_causal) {
+                    int k_abs_idx = kv_start + k_col;
+                    if (k_abs_idx > q_abs_idx) {
+                        score = -INFINITY;
+                    }
+                }
+                
+                s_tile[local_q_idx][k_col] = score;
             }
         }
-        __syncthreads(); // Ensure all S_ij scores are computed.
-
-        // --- Online Softmax: Update Statistics and Output Accumulator ---
-        if (valid_q) {
-            // 1. Find maximum score using warp-level reduction
-            float block_max_s = -std::numeric_limits<float>::infinity();
+        __syncthreads();
+        
+        // Online softmax update
+        if (valid_q && local_q_idx < T_r) {
+            // Find max in current tile
+            float tile_max = -INFINITY;
             for (int k_col = 0; k_col < T_c; ++k_col) {
-                block_max_s = fmaxf(block_max_s, s_tile[local_q_idx][k_col]);
+                tile_max = fmaxf(tile_max, s_tile[local_q_idx][k_col]);
             }
-
-            // 2. Update global maximum m_i
-            float new_m_i = fmaxf(m_i, block_max_s);
             
-            // 3. Compute scaling factors
-            float exp_diff_old = (m_i == -std::numeric_limits<float>::infinity()) ? 0.0f : expf(m_i - new_m_i);
+            // Update global max
+            float new_m_i = fmaxf(m_i, tile_max);
+            float exp_diff = (m_i == -INFINITY) ? 0.0f : expf(m_i - new_m_i);
             
-            // 4. Compute sum of exp(s_ij - new_m_i) for current tile
+            // Compute tile sum
             float tile_sum = 0.0f;
             for (int k_col = 0; k_col < T_c; ++k_col) {
                 tile_sum += expf(s_tile[local_q_idx][k_col] - new_m_i);
             }
-
-            // 5. Update l_i (running sum for normalizer)
-            float new_l_i = exp_diff_old * l_i + tile_sum;
-
-            // 6. Update output accumulator o_i with reduced register usage
-            // Scale previous contributions and add new ones in single pass
-            for (int h_col = 0; h_col < actual_head_dim; ++h_col) {
+            
+            // Update normalizer
+            float new_l_i = exp_diff * l_i + tile_sum;
+            
+            // Update output accumulator
+            #pragma unroll 4
+            for (int d = 0; d < actual_head_dim; ++d) {
                 float new_contrib = 0.0f;
                 for (int k_col = 0; k_col < T_c; ++k_col) {
-                    float p_ij = expf(s_tile[local_q_idx][k_col] - new_m_i);
-                    new_contrib += p_ij * v_tile[k_col][h_col];
+                    float p_val = expf(s_tile[local_q_idx][k_col] - new_m_i);
+                    new_contrib += p_val * v_tile[k_col][d];
                 }
-                o_i[h_col] = o_i[h_col] * exp_diff_old + new_contrib;
+                o_acc[d] = o_acc[d] * exp_diff + new_contrib;
             }
-
-            // 7. Update statistics
+            
             m_i = new_m_i;
             l_i = new_l_i;
         }
-        __syncthreads(); // Ensure all threads finish before next KV tile
-    } // End of KV tiles loop
-
-    // --- Final Output and Statistics ---
-    if (valid_q) {
-        // Normalize final output
-        float inv_l_i = 1.0f / l_i;
-        for (int h_col = 0; h_col < actual_head_dim; ++h_col) {
-            o_i[h_col] *= inv_l_i;
+        __syncthreads();
+    }
+    
+    // Write final output
+    if (valid_q && local_q_idx < T_r) {
+        float inv_l = 1.0f / l_i;
+        
+        for (int d = col_offset; d < actual_head_dim; d += threads_per_row) {
+            O_acc[batch_idx][head_idx][q_abs_idx][d] = o_acc[d] * inv_l;
         }
-
-        // Write output to global memory
-        for (int h_col = threadIdx.x; h_col < actual_head_dim; h_col += blockDim.x) {
-            O_acc[batch_idx][head_idx][q_abs_idx][h_col] = o_i[h_col];
-        }
-
-        // Write logsumexp (for backward pass)
-        if (threadIdx.x == 0) {
+        
+        if (col_offset == 0) {
             L_acc[batch_idx][head_idx][q_abs_idx] = m_i + logf(l_i);
         }
     }
@@ -303,12 +278,16 @@ void flash_attention_forward_cuda(
     TORCH_CHECK(head_dim <= HEAD_DIM_MAX_VAL, "Head dimension exceeds compiled maximum HEAD_DIM_MAX.");
     
     // --- Kernel Launch Configuration ---
-    // Warp-optimized thread block configuration for maximum performance
-    // Use 32-thread warps efficiently, minimize thread divergence
+    // Optimized thread block configuration for warp efficiency
+    // Use powers of 2 for optimal memory coalescing and warp utilization
     dim3 threads_per_block;
-    if (head_dim <= 32) threads_per_block = dim3(32, 4, 1); // 128 threads: Full warp width for coalescing
-    else if (head_dim <= 64) threads_per_block = dim3(32, 8, 1); // 256 threads: Full warp with more rows
-    else threads_per_block = dim3(32, 8, 1); // 256 threads: Maintain warp efficiency
+    if (head_dim <= 32) {
+        threads_per_block = dim3(128, 1, 1); // 128 threads = 4 warps, optimal for small head dims
+    } else if (head_dim <= 64) {
+        threads_per_block = dim3(256, 1, 1); // 256 threads = 8 warps, good for medium head dims 
+    } else {
+        threads_per_block = dim3(256, 1, 1); // 256 threads = 8 warps, handles large head dims
+    }
 
     // Define grid dimensions. Each block processes T_r_DEFAULT rows of Q.
     dim3 num_blocks((seq_len_q + T_r_DEFAULT_VAL - 1) / T_r_DEFAULT_VAL, num_heads, batch_size);
