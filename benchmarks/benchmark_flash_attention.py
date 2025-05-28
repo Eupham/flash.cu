@@ -3,11 +3,15 @@ FlashAttention Benchmark Script
 
 This script benchmarks the custom FlashAttention implementation against PyTorch's
 standard `torch.nn.MultiheadAttention`. It measures the execution time for
-both the forward pass and the combined forward + backward pass.
+both the forward pass and the combined forward + backward pass, along with
+memory usage and numerical accuracy.
 
 The script allows configuration of various parameters such as sequence length,
 batch size, number of heads, head dimension, data type (FP32/FP16), and causality.
 Results are printed in a formatted table, facilitating performance comparisons.
+
+For a more comprehensive speed and accuracy comparison, use:
+    python benchmarks/speed_accuracy_comparison.py
 
 Note:
 - The custom FlashAttention implementation currently supports FP32 for its CUDA kernels.
