@@ -3,6 +3,8 @@
 #include <cublas_v2.h>
 #include <cmath>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 
 // Constants
 constexpr float LN2 = 0.6931471824645996f;
