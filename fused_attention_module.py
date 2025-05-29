@@ -29,7 +29,7 @@ if not os.path.exists(cuda_source_path):
 # This will compile the .cu file when the module is imported for the first time.
 try:
     fused_attention_kernels = load(
-        name="fused_attention_kernels",
+        name="jules_custom_fused_attention_kernels_v1",
         sources=[cuda_source_path],
         verbose=True, # Set to False for less output during compilation
         extra_cuda_cflags=['-O3'] # Example of adding compiler flags
@@ -260,7 +260,7 @@ if __name__ == '__main__':
                 traceback.print_exc()
 
     elif isinstance(fused_attention_kernels, PlaceholderKernels):
-         print("CUDA kernels were not compiled. Skipping FusedAttention tests.")
+        print("CUDA kernels were not compiled. Skipping FusedAttention tests.")
     else:
         print("CUDA is not available. Skipping FusedAttention tests.")
 

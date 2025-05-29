@@ -308,3 +308,5 @@ if __name__ == '__main__':
         print(df_results.to_string())
     else:
         print("\nNo benchmark results to display.")
+
+```
